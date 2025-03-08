@@ -345,7 +345,7 @@ func (t *table) grow(w int) *table {
 }
 
 func (t *table) jump(e *entry) *entry {
-	index := e.hash >> (64 - t.width)
+	index := e.hash >> (uint64w - t.width)
 
 	start := t.entries[index].Load()
 	if start == nil {
@@ -367,7 +367,7 @@ func (t *table) jumpSlow(index uint64) *entry {
 
 	start = t.jumpSlow(index - 1)
 
-	hash := index << (64 - t.width)
+	hash := index << (uint64w - t.width)
 
 	e := &entry{
 		hash: hash,
