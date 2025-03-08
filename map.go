@@ -27,15 +27,12 @@ package xsync
 //
 // we can do all of the above in a lock free manner:
 //
-// - it's always safe to read an item once it's in the list
-//   as only the next pointer can change
-// - we always search for the last matching item in the list
-// - inserting a new entry into the list does not require taking a lock
-// - deleting replaced entries is always safe because we insert a tombstone
-//
 // the logic is this
-
-// - we insert new entries after all other matching entries, never inbetween
+//
+// - it's always safe to read an item once it's in the list,
+//   as only the next pointer can change
+// - inserting a new entry into the list does not require taking a lock,
+//   and we always insert new entries after all other matching entries
 //   (and so once an entry has been replaced, its next pointer is fixed)
 // - if we need to insert after a tombstone, we remove tombstone first
 //   (and so tombstone next pointers are never changed)
@@ -46,7 +43,9 @@ package xsync
 // of the node you're deleting, but only after you update the predecessor to
 // exclude it. this leaves a new item dangling without anyone knowing.
 //
-// freezing the next pointer prevents any lost updates
+// freezing the next pointer prevents any lost updates. essentially it
+// acts as both a lock on the key, and a lock over the gap between it
+// and the next key.
 //
 // ... but wait, there's more!
 //
@@ -55,16 +54,14 @@ package xsync
 // pointing to them. this allows us to jump deeply into the
 // linked list, avoiding substantial amounts of searching
 //
-// a three bit jump table has eight dummy entries in the list
-// for all possible three bit prefixes of a hash, e.g.
+// for example: a three bit jump table has eight dummy entries in the list
+// for all possible three bit prefixes of a hash.
 //
 //     `000 -> 001 -> 010 -> 011 -> 100 -> 101 -> 110 -> 111`
 //
-// we just keep an array of dummy entries, where the prefix bits are
-// the array index, so prefix 001 is entry 1 in the array, etc
-//
-// when we resize the array, we copy across the old dummy entries,
-// then we insert new dummy elemenents into the list and new array.
+// the jump table is all the dummy entries in order, and
+// when we resize the array, we copy across the old dummy entries
+// into their new positions.
 //
 // this strucure is very similar to
 //
