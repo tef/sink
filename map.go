@@ -10,50 +10,43 @@ package xsync
 //     start, a1, b1,, end
 // ```
 //
-// effectively, this is a mvcc list: we insert new entries, before
-// removing old entries, and we also insert a tombstone into the list
-// before removing it and the previous entry.
+// the list is a bit mvcc: we always insert a new entry to make a change,
+// either the newer version, or a tombstone. once inserted, we go back
+// and clean up the list:
 //
-// this means that when we look for an entry in the list, we must
-// not stop at the first match, and only consider the last match
-// to be valid, as we may encounter a tombstone, or a new version.
+// ```
+//     start, a1, a2, b1, bX, c1, c2, c3, end
+//     start, a2, c3, end
+// ```
 //
-// this might seem a little excessive, but we have good reason: keeping
-// new versions at the end allows us to do lock-free operations without
-// pointer tagging, or indirection nodes.
+// when we search through the list, the first matching entry may
+// not be the most recent version, and so we must continue searching
+// through until the last matching entry, which may be a tombstone.
 //
-// if we hold the following invariants:
+// this might seem a little excessive, but we have good reason.
 //
+// we can do all of the above in a lock free manner:
+//
+// - it's always safe to read an item once it's in the list
+//   as only the next pointer can change
 // - we always search for the last matching item in the list
-//    (and so we always check for tombstones or newer versions)
+// - inserting a new entry into the list does not require taking a lock
+// - deleting replaced entries is always safe because we insert a tombstone
+//
+// the logic is this
+
 // - we insert new entries after all other matching entries, never inbetween
 //   (and so once an entry has been replaced, its next pointer is fixed)
 // - if we need to insert after a tombstone, we remove tombstone first
 //   (and so tombstone next pointers are never changed)
-//
-// then after inserting a new entry or tombstone, it will always
-// be safe to remove the old entries from the list.
+// - as old versions and tombstones have frozen next pointers, we can
+//   patch them out of the list, without worrying about other threads
 //
 // the usual problem is that another thread updates the next pointer
-// of the node you're deleting, after you update the predecessor to
+// of the node you're deleting, but only after you update the predecessor to
 // exclude it. this leaves a new item dangling without anyone knowing.
 //
-// we prevent this, as the next pointer cannot be updated by other threads
-// in these instances. tombstones's next pointers are never changed, and
-// old entries next pointers never change once a new version is inserted.
-//
-// it's worth noting that pointer tagging is another means of freezing
-// the next pointers. with tagged pointers, you don't need tombstones,
-// and you can always return the first match.
-//
-// with pointer tagging, you do need the gc to know what you're up to, and
-// you do need to use unsafe, unportable code to make it work. the other
-// alternative, indirection nodes, involves doubling the linked list
-// in size.
-//
-// the "return the last matching entry" method may not be as clever
-// or as simple as the alternatives, but it works without unsafe, and
-// works faster than indirection pointers
+// freezing the next pointer prevents any lost updates
 //
 // ... but wait, there's more!
 //
@@ -73,17 +66,33 @@ package xsync
 // when we resize the array, we copy across the old dummy entries,
 // then we insert new dummy elemenents into the list and new array.
 //
-// aside:
+// this strucure is very similar to
 //
-// there's a fancy way to store this jump table: reverse the hash
-// and take the lower bits as the table index. this keeps the items
-// ordered by their trailing zeros, so as we grow the table, a prefix
-// always has the same location in the table
+// "Split-Ordered Lists: Lock-Free Extensible Hash Tables"
+//
+// the key differences are:
+//
+// the paper uses pointer tagging to freeze out next pointers, whereas
+// we use a tombstone. they can stop at the first match, but we have to
+// continue. 
+//
+// tagging pointers might require a little bit of cooperation from the
+// garbage collector, which is why we do not use it here
+//
+// the other major difference is that the paper uses a bithack to
+// avoid reordering the jump table during resizes. instead of lexicographic
+// order, they reverse the bits and so effectively sort it by trailing 
+// zero count.
 //
 // as we replace the jump table each time it grows, we don't need
 // to worry about preserving the offsets into the table during resizes,
 // and keeping things in lexicographic order means that we can
 // handle missing jump entries with very little fuss.
+//
+// in some ways, this is a simplification (no pointer tagging, no bithacks)
+// but in others, it's a complication (read until last match, tombstones)
+//
+// c'est la vie
 
 import (
 	"cmp"
