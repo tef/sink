@@ -161,10 +161,6 @@ const tombstone_mask = 3
 //    0011, real tombstone
 //    1110, end sentinel value
 
-func spin() {
-	time.Sleep(150 * time.Millisecond)
-}
-
 type entry struct {
 	hash  uint64
 	key   string
@@ -314,7 +310,7 @@ func (c *cursor) find(needle *entry) bool {
 	return c.match != nil && !c.match.isDeleted()
 }
 
-func (c *cursor) findRepair(needle *entry) bool {
+func (c *cursor) findSlow(needle *entry) bool {
 	// always called on a ready entry
 	var prev_match, match, prev_next, next, after *entry
 
@@ -355,6 +351,27 @@ func (c *cursor) findRepair(needle *entry) bool {
 	return c.match != nil && !c.match.isDeleted()
 }
 
+func (c *cursor) insert_after_prev(e *entry) bool {
+	// called after ready()
+	if !c.prev.isDeleted() && c.prev.insert_after(e, c.next) {
+		c.match = e
+		return true
+	}
+	return false
+}
+
+func (c *cursor) insert_after_match(e *entry) bool {
+	if !c.match.isDeleted() && c.match.insert_after(e, c.next) {
+		c.match = e
+		return true
+	}
+	return false
+}
+
+func (c *cursor) replace_after_prev(e *entry) bool {
+	return !c.prev.isDeleted() && c.prev.replace_next(e, c.match)
+}
+
 func (c *cursor) repair_from_start() bool {
 	// compact every entry from start to next
 
@@ -364,24 +381,8 @@ func (c *cursor) repair_from_start() bool {
 		return false
 	}
 
-	slow.findRepair(c.next)
+	slow.findSlow(c.next)
 	return true
-}
-
-func (c *cursor) insert_after_prev(e *entry) bool {
-	return !c.prev.isDeleted() && c.prev.insert_after(e, c.next)
-}
-
-func (c *cursor) insert_after_match(e *entry) bool {
-	if c.match.isDeleted() {
-		return false
-	}
-
-	return c.match.insert_after(e, c.next)
-}
-
-func (c *cursor) replace_after_prev(e *entry) bool {
-	return !c.prev.isDeleted() && c.prev.replace_next(e, c.match)
 }
 
 func (c *cursor) count_empty(n int) int {
@@ -417,6 +418,11 @@ type table struct {
 	expunged *entry
 }
 
+func (t *table) pause() {
+	d := 128 - t.width - (t.width >> 1)
+	time.Sleep(time.Duration(d) * time.Millisecond)
+}
+
 func (t *table) hash(key string) uint64 {
 	hash := maphash.String(t.seed, key)
 	return (hash & hash_mask) | entry_mask
@@ -427,7 +433,7 @@ func (t *table) tombstone_hash(key string) uint64 {
 	return (hash & hash_mask) | tombstone_mask
 }
 
-func (t *table) startPoint(e *entry) cursor {
+func (t *table) cursorFor(e *entry) cursor {
 	index := e.hash >> (uint64w - t.width)
 	var c cursor
 
@@ -456,7 +462,7 @@ func (t *table) startPoint(e *entry) cursor {
 
 		nt := t.new.Load()
 		if nt != nil {
-			return nt.startPoint(e)
+			return nt.cursorFor(e)
 		}
 
 		// alas, if we're the most recent table, someone has decided to
@@ -467,7 +473,7 @@ func (t *table) startPoint(e *entry) cursor {
 		}
 
 		// and insertDummy will compact it and try again
-		spin()
+		t.pause()
 	}
 
 	return c
@@ -478,16 +484,6 @@ func (t *table) insertDummy(index uint64) *entry {
 		return t.start
 	}
 
-	start := t.entries[index].Load()
-	if start != nil {
-		return start
-	}
-
-	start = t.insertDummy(index - 1)
-	if start == t.expunged || start == nil {
-		return start
-	}
-
 	hash := index << (uint64w - t.width)
 
 	e := &entry{
@@ -496,6 +492,7 @@ func (t *table) insertDummy(index uint64) *entry {
 
 	var c cursor
 	var old *entry
+	var start *entry
 	var inserted *entry
 
 	for true {
@@ -506,19 +503,25 @@ func (t *table) insertDummy(index uint64) *entry {
 			return old
 		}
 
+		start = t.insertDummy(index - 1)
+		if start == t.expunged || start == nil {
+			return start
+		}
+
 		c = start.cursor()
 
 		if c.ready() {
 			// someone else already put it in the list, so we use it
 			// and try to insert it into the table (we're helping!)
 
-			if c.findRepair(e) {
+			if c.find(e) {
 				e = c.match
 				break
 			}
 
 			if c.match != nil && c.match.isDeleted() {
 				// we found a dummy tombstone, so compact
+				// and retry
 				c.prev.compact(nil)
 				continue
 			}
@@ -526,40 +529,31 @@ func (t *table) insertDummy(index uint64) *entry {
 			if c.insert_after_prev(e) {
 				inserted = e
 				break
+			} else {
+				c.repair_from_start()
 			}
 		} else {
-			// our start point has been deleted with a tombstone, after
-			// we loaded it, but our table is not being expunged
-
-			// ... so clear it out, and try again
+			// we found a tombstone, so we clear it out
+			// and try again
 
 			t.entries[index].CompareAndSwap(start, nil)
-
-			start = t.insertDummy(index - 1)
-			if start == t.expunged || start == nil {
-				return start
-			}
 		}
 	}
 
 	// insert/lookup succeded, table still empty
 
-	for true {
-		if t.entries[index].CompareAndSwap(nil, e) {
-			return e
-		}
-		old = t.entries[index].Load()
+	if t.entries[index].CompareAndSwap(nil, e) {
+		return e
+	}
 
-		if old == e {
-			return e
-		} else if old == e {
-			spin()
-			continue
-		} else if old == t.expunged {
-			break
-		} else {
-			panic("what??")
-		}
+	old = t.entries[index].Load()
+
+	if old == e {
+		return e
+	}
+
+	if old != t.expunged {
+		panic("what??")
 	}
 
 	// our table is being expunged
@@ -586,7 +580,7 @@ func (t *table) insertDummy(index uint64) *entry {
 		}
 
 		if !c2.insert_after_prev(tombstone) {
-			spin()
+			t.pause()
 			continue
 		}
 
@@ -628,7 +622,7 @@ func (t *table) repairDummyInsert(e *entry) bool {
 }
 
 func (t *table) lookup(e *entry) *entry {
-	c := t.startPoint(e)
+	c := t.cursorFor(e)
 
 	if c.find(e) {
 		return c.match
@@ -638,7 +632,7 @@ func (t *table) lookup(e *entry) *entry {
 }
 
 func (t *table) store(e *entry) (bool, int) {
-	c := t.startPoint(e)
+	c := t.cursorFor(e)
 
 	if !c.find(e) {
 		if !c.insert_after_prev(e) {
@@ -658,16 +652,16 @@ func (t *table) store(e *entry) (bool, int) {
 
 func (t *table) storeSlow(e *entry) (bool, int) {
 	for true {
-		c := t.startPoint(e)
+		c := t.cursorFor(e)
 
 		if !c.find(e) {
 			if !c.insert_after_prev(e) {
-				spin()
+				t.pause()
 				continue
 			}
 		} else {
 			if !c.insert_after_match(e) {
-				spin()
+				t.pause()
 				continue
 			}
 			if !c.replace_after_prev(e) {
@@ -684,14 +678,14 @@ func (t *table) storeSlow(e *entry) (bool, int) {
 func (t *table) delete(e *entry, maxCount int) (bool, int) {
 	count := 0
 	for true {
-		c := t.startPoint(e)
+		c := t.cursorFor(e)
 
 		if !c.find(e) {
 			return false, 0
 		}
 
 		if !c.insert_after_match(e) {
-			spin()
+			t.pause()
 			continue
 		}
 
@@ -781,7 +775,9 @@ func (t *table) sweepOld() {
 
 	// fmt.Printf("sweeping v%d's old (v%d), from %d to %d\n", t.version, old.version, old.width, t.width)
 
-	for i := range old.entries {
+	var compact *entry
+
+	for i := len(old.entries) - 1; i >= 0; i-- {
 		// we mark out every old entry, even ones we copied over
 		// to stop new entries being added to the old table
 
@@ -799,6 +795,19 @@ func (t *table) sweepOld() {
 			t.entries[j].CompareAndSwap(nil, o)
 			continue
 
+		}
+
+		// we're shrinking, and so we try and compact the tail
+
+		if compact != nil {
+			c2 := o.cursor()
+			if c2.ready() {
+				c2.findSlow(compact) // compact up to this target
+				// if we found it, then it wasn't deleted
+				if c2.match == nil {
+					compact = nil
+				}
+			}
 		}
 
 		// if we're shrinking, then we copy
@@ -819,19 +828,22 @@ func (t *table) sweepOld() {
 			c := o.cursor()
 			if c.ready() {
 				if !c.insert_after_prev(e) {
-					spin()
+					t.pause()
 					continue
 				}
-				//fmt.Println("tombstone")
+				if compact == nil {
+					compact = e
+				}
 			}
 			break
 		}
+
 	}
 
-	if gap > 0 {
+	if compact != nil {
 		c := t.start.cursor()
 		if c.ready() {
-			c.findRepair(t.end)
+			c.findSlow(compact)
 		}
 	}
 
@@ -839,7 +851,7 @@ func (t *table) sweepOld() {
 		if t.old.Load() == nil {
 			break
 		}
-		spin()
+		t.pause()
 	}
 
 	// fmt.Printf("done sweeping v%d's old (v%d), clearing old\n", t.version, old.version)
@@ -858,7 +870,7 @@ func (m *Map) resize(from int, to int) {
 
 	old := t.old.Load()
 	if old != nil {
-		// t.sweepOld()
+		// we could run t.sweepOld()
 		return // already shrinking
 	}
 
@@ -876,8 +888,8 @@ func (m *Map) tryResize(from int, to int) {
 
 	old := t.old.Load()
 	if old != nil {
-		go t.sweepOld()
-		return // still sweeping old, so help
+		// could run t.sweepddOld()
+		return
 	}
 
 	new := t.new.Load()
@@ -900,8 +912,8 @@ func (m *Map) tryResize(from int, to int) {
 }
 func (m *Map) waitResize() {
 	for true {
-		spin()
 		t := m.t.Load()
+		t.pause()
 		if t == nil {
 			break
 		}
@@ -917,8 +929,8 @@ func (m *Map) waitResize() {
 
 func (m *Map) waitGrow(w int) {
 	for true {
-		spin()
 		t := m.t.Load()
+		t.pause()
 		if t == nil {
 			break
 		}
@@ -936,8 +948,8 @@ func (m *Map) waitGrow(w int) {
 
 func (m *Map) waitShrink(w int) {
 	for true {
-		spin()
 		t := m.t.Load()
+		t.pause()
 		if t == nil {
 			break
 		}
