@@ -680,9 +680,12 @@ func (t *table) sweepOld() {
 			break
 		}
 	}
-	c := t.start.cursor()
-	if c.ready() {
-		c.findRepair(t.end)
+
+	if gap > 0 {
+		c := t.start.cursor()
+		if c.ready() {
+			c.findRepair(t.end)
+		}
 	}
 
 	t.old.CompareAndSwap(old, nil)
