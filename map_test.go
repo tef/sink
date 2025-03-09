@@ -59,27 +59,15 @@ func TestMapGrow(t *testing.T) {
 		}
 	}
 
+	t.Log("grow 4")
 	m.grow(4)
 	m.waitGrow(4)
-	t.Log("fill")
 	m.fill()
-	m.print()
 
-	entries := m.table().entries
-	for i := range entries {
-		t.Logf("%d, %064b\n", i, entries[i].Load().hash)
-	}
-	m.print()
-
-	t.Log("shrink")
+	t.Log("shrink 2")
 	m.grow(2)
 	m.waitGrow(2)
-	t.Log("fill")
 	m.fill()
-	entries = m.table().entries
-	for i := range entries {
-		t.Logf("%d, %064b\n", i, entries[i].Load().hash)
-	}
 	m.print()
 
 	t.Log("first wave")
@@ -140,8 +128,12 @@ func TestMapGrow(t *testing.T) {
 	} else {
 		t.Logf("lookup: %v", v)
 	}
-	fmt.Println("done")
+	t.Log("done")
 	t.Log(m.table().width)
+	m.grow(1)
+	m.waitGrow(1)
+	t.Log(m.table().width)
+	m.print()
 
 }
 

@@ -102,9 +102,12 @@ import (
 	"time"
 )
 
-const hashBits = 56 // width of uint64 - flag nibble
-const mask = 0xFFFF_FFFF_FFFF_FFF0
 const uint64w = 64
+const hashBits = 56 // width of uint64 - flag nibble
+
+const hash_mask = 0xFFFF_FFFF_FFFF_FFF0
+const entry_mask = 2
+const tombstone_mask = 3
 
 // bit 0 is deleted, bit 1 is real/placeholder, bit 2 is sentinel
 // so 000 = dummy item
@@ -118,8 +121,16 @@ type entry struct {
 	next  atomic.Pointer[entry]
 }
 
-func (e *entry) deleted() bool {
+func (e *entry) isDeleted() bool {
 	return e.hash&1 == 1
+}
+
+func (e *entry) isDummy() bool {
+	return e.hash&2 == 0
+}
+
+func (e *entry) cursor() cursor {
+	return cursor{start: e, prev: e}
 }
 
 func (e *entry) compare(o *entry) int {
@@ -139,62 +150,88 @@ func (e *entry) replace_next(value *entry, old *entry) bool {
 	return e.next.CompareAndSwap(old, value)
 }
 
+func (e *entry) compact(next *entry) (*entry, *entry) {
+	if next == nil {
+		next = e.next.Load()
+	}
+
+	if next == nil {
+		return nil, nil
+	}
+
+	start := next
+	end := start
+	next = end.next.Load()
+
+	// we search for  e ---> (start ---> .... ---> end) --> next
+	// where start ... end are all entries for the same value
+
+	for next != nil && start.compare(next) == 0 {
+		end = next
+		next = next.next.Load()
+	}
+
+	// if we've found a chain, then we can compact it.
+	// if end is deleted, the whole thing can go
+	// if end is fresh, the rest can go
+
+	if start != end {
+		if end.isDeleted() {
+			if e.replace_next(next, start) {
+				end = nil
+			}
+		} else {
+			e.replace_next(end, start)
+		}
+	}
+	return end, next
+}
+
 // a cursor represents an insertion point in the list
 //
-// it starts as (node, nil, nil), then
-// walks to find a point in the list, returning
-// either a triplet, (predecesor, matching node, successor)
-// or a doublet (predecessor, nil, successor)
+// it starts as (start, nil, nil, nil), then
+// walks to find a point in the list for a given entry
 //
-// and inserts into the gap, or after the match
-// via compare and swap operations
+// ending up as (start, predecessor, matching node, successor)
+// or just      (start, predecessor, nil, successor)
+//
+// the cursor can then go on to insert after the matching node
+// or affter the predecessor
 
 type cursor struct {
+	start *entry
+
 	prev  *entry
 	match *entry
 	next  *entry
+
 	count int
 }
 
-func (c *cursor) found(e *entry) *entry {
-	if c.match == nil || c.match.deleted() {
-		return nil
+func (c *cursor) ready() bool {
+	if c.prev == nil {
+		c.prev = c.start
 	}
-	return c.match
-}
-
-func (c *cursor) insert_after_prev(e *entry) bool {
-	return !c.prev.deleted() && c.prev.insert_after(e, c.next)
-}
-
-func (c *cursor) insert_after_match(e *entry) bool {
-	if c.match.deleted() {
+	if c.prev == nil {
 		return false
 	}
 
-	return c.match.insert_after(e, c.next)
+	if c.next == nil {
+		c.next = c.prev.next.Load()
+	}
+
+	if c.next == nil || c.next.isDeleted() {
+		return false
+	}
+	return true
 }
 
-func (c *cursor) replace_after_prev(e *entry) bool {
-	return !c.prev.deleted() && c.prev.replace_next(e, c.match)
-}
-
-func (c *cursor) walk(needle *entry) bool {
-	// always called on a dummy entry
+func (c *cursor) find(needle *entry) bool {
+	// always called on a ready entry
 	var prev_match, match, next *entry
 
 	prev_match = c.prev
-	if prev_match.compare(needle) > 0 {
-		return false
-	}
-
-	// potentially first real element or
-	// deletion marker for dummy
-	next = prev_match.next.Load()
-
-	if next == nil || next.deleted() {
-		return false
-	}
+	next = c.next
 
 	count := 0
 	for next != nil {
@@ -217,27 +254,17 @@ func (c *cursor) walk(needle *entry) bool {
 	c.match = match
 	c.next = next
 	c.count = count
-	return true
+
+	return c.match != nil && !c.match.isDeleted()
 }
 
-func (c *cursor) walkSlow(needle *entry) bool {
-	// always called on a dummy entry
-	var prev_match, match, prev_next, next *entry
+func (c *cursor) findRepair(needle *entry) bool {
+	// always called on a ready entry
+	var prev_match, match, prev_next, next, after *entry
 
 	prev_next = c.prev
-	if prev_next.compare(needle) > 0 {
-		return false
-	}
-
-	prev_match = prev_next
-	// potentially first real element or
-	// deletion marker for dummy
-
-	next = prev_next.next.Load()
-
-	if next == nil || next.deleted() {
-		return false
-	}
+	prev_match = c.prev
+	next = c.next
 
 	count := 0
 	for next != nil {
@@ -247,10 +274,7 @@ func (c *cursor) walkSlow(needle *entry) bool {
 			break
 		}
 
-		cur := cursor{prev_next, nil, next, 0}
-		cur.compact()
-
-		next = cur.match
+		next, after = prev_next.compact(next)
 
 		if next != nil {
 			count += 1
@@ -263,7 +287,7 @@ func (c *cursor) walkSlow(needle *entry) bool {
 			}
 		}
 
-		next = cur.next
+		next = after
 
 	}
 
@@ -271,61 +295,46 @@ func (c *cursor) walkSlow(needle *entry) bool {
 	c.match = match
 	c.next = next
 	c.count = count
+
+	return c.match != nil && !c.match.isDeleted()
+}
+
+func (c *cursor) repair_from_start() bool {
+	slow := c.start.cursor()
+
+	if !slow.ready() {
+		return false
+	}
+
+	slow.findRepair(c.next)
 	return true
 }
 
-func (c *cursor) compact() {
-	prev_next := c.prev
-
-	start := c.next
-	end := c.next
-
-	next := end.next.Load()
-
-	// find the end of the chain
-	for next != nil && start.compare(next) == 0 {
-		end = next
-		next = next.next.Load()
-	}
-
-	// we know that prev_next ---> (start ---> end) --> next
-	// and start and end are all entries for the same value
-
-	// ... but! we cannot delete it all unless end is deleted
-	// because end --> next can change under insert
-	// but ---> end should be stable, so we can delete that
-
-	if start != end {
-		if end.deleted() {
-			if prev_next.replace_next(next, start) {
-				end = nil
-			}
-		} else {
-			prev_next.replace_next(end, start)
-		}
-	}
-
-	c.match = end
-	c.next = next
+func (c *cursor) insert_after_prev(e *entry) bool {
+	return !c.prev.isDeleted() && c.prev.insert_after(e, c.next)
 }
 
-func (c *cursor) repair_from(start *entry) {
-	for {
-		slow := cursor{prev: start}
-		if slow.walkSlow(c.next) {
-			return
-		}
+func (c *cursor) insert_after_match(e *entry) bool {
+	if c.match.isDeleted() {
+		return false
 	}
+
+	return c.match.insert_after(e, c.next)
+}
+
+func (c *cursor) replace_after_prev(e *entry) bool {
+	return !c.prev.isDeleted() && c.prev.replace_next(e, c.match)
 }
 
 func (c *cursor) count_empty() int {
-	if c.prev.hash&15 != 0 || c.next.hash&15 != 0 {
+	// check the next for dummy entries
+	if !c.next.isDummy() {
 		return 0
 	}
 
 	count := 1
 	next := c.next.next.Load()
-	for next != nil && next.hash&15 == 0 {
+	for next != nil && next.isDummy() {
 		next = next.next.Load()
 		count += 1
 
@@ -342,30 +351,47 @@ type table struct {
 	entries []atomic.Pointer[entry]
 
 	new atomic.Pointer[table]
+	old atomic.Pointer[table]
 }
 
 func (t *table) hash(key string) uint64 {
 	hash := maphash.String(t.seed, key)
-	return (hash & mask) | 2
+	return (hash & hash_mask) | entry_mask
 }
 
 func (t *table) tombstone_hash(key string) uint64 {
 	hash := maphash.String(t.seed, key)
-	return (hash & mask) | 3
+	return (hash & hash_mask) | tombstone_mask
 }
 
-func (t *table) jump(e *entry) *entry {
+func (t *table) cursorFor(e *entry) cursor {
 	index := e.hash >> (uint64w - t.width)
 
 	start := t.entries[index].Load()
 	if start == nil {
-		return t.jumpSlow(index)
+		start = t.insertDummy(index)
 	}
 
-	return start
+	cursor := start.cursor()
+
+	if !cursor.ready() {
+		// if the dummy is marked for deletion
+		// a shrink must have occurred
+		new := t.new.Load()
+		if new == nil {
+			panic("bad: dummy marked for deletion but no new table")
+		}
+		return new.cursorFor(e)
+	}
+
+	if start.compare(e) > 0 {
+		panic("bad")
+	}
+
+	return cursor
 }
 
-func (t *table) jumpSlow(index uint64) *entry {
+func (t *table) insertDummy(index uint64) *entry {
 	if index == 0 {
 		return t.start
 	}
@@ -375,7 +401,11 @@ func (t *table) jumpSlow(index uint64) *entry {
 		return start
 	}
 
-	start = t.jumpSlow(index - 1)
+	start = t.insertDummy(index - 1)
+
+	if start.isDeleted() {
+		return start
+	}
 
 	hash := index << (uint64w - t.width)
 
@@ -383,52 +413,64 @@ func (t *table) jumpSlow(index uint64) *entry {
 		hash: hash,
 	}
 
-	for true {
-		cursor := cursor{prev: start}
-		cursor.walkSlow(e)
+	old := t.entries[index].Load()
+	for old == nil {
+		c := start.cursor()
+		if c.ready() {
+			if c.findRepair(e) {
+				e = c.match
+				break
+			}
 
-		if match := cursor.found(e); match != nil {
-			return match
+			if c.insert_after_prev(e) {
+				break
+			}
 		}
-		if cursor.insert_after_prev(e) {
+		old = t.entries[index].Load()
+	}
+
+	for true {
+		if old != nil && old.isDeleted() {
+			// just in case
+
+			t := &entry{hash: e.hash | 1}
+			for true {
+				c := e.cursor()
+				if !c.ready() {
+					return old
+				}
+				if c.insert_after_prev(t) {
+					return old
+				}
+			}
+		}
+		if old != nil {
+			return old
+		}
+
+		if t.entries[index].CompareAndSwap(nil, e) {
 			break
 		}
+		old = t.entries[index].Load()
 	}
 
-	start = t.entries[index].Load()
-	if start != nil {
-		return start
-	}
-
-	if t.entries[index].CompareAndSwap(nil, e) {
-		return e
-	}
-
-	return t.entries[index].Load()
+	return e
 }
 
 func (t *table) lookup(e *entry) *entry {
-	start := t.jump(e)
-	cursor := cursor{prev: start}
-	cursor.walk(e)
+	c := t.cursorFor(e)
 
-	if found := cursor.found(e); found != nil {
-		return found
+	if c.find(e) {
+		return c.match
 	}
-	return nil
 
+	return nil
 }
 
 func (t *table) store(e *entry) (bool, int) {
-	start := t.jump(e)
-	c := cursor{prev: start}
-	if !c.walk(e) {
-		return t.storeSlow(e)
-	}
+	c := t.cursorFor(e)
 
-	match := c.found(e)
-
-	if match == nil {
+	if !c.find(e) {
 		if !c.insert_after_prev(e) {
 			return t.storeSlow(e)
 		}
@@ -437,7 +479,7 @@ func (t *table) store(e *entry) (bool, int) {
 			return t.storeSlow(e)
 		}
 		if !c.replace_after_prev(e) {
-			c.repair_from(start)
+			c.repair_from_start()
 		}
 	}
 
@@ -446,15 +488,9 @@ func (t *table) store(e *entry) (bool, int) {
 
 func (t *table) storeSlow(e *entry) (bool, int) {
 	for true {
-		start := t.jump(e)
-		c := cursor{prev: start}
-		if !c.walk(e) {
-			continue
-		}
+		c := t.cursorFor(e)
 
-		match := c.found(e)
-
-		if match == nil {
+		if !c.find(e) {
 			if !c.insert_after_prev(e) {
 				continue
 			}
@@ -463,7 +499,7 @@ func (t *table) storeSlow(e *entry) (bool, int) {
 				continue
 			}
 			if !c.replace_after_prev(e) {
-				c.repair_from(start)
+				c.repair_from_start()
 			}
 		}
 
@@ -476,15 +512,9 @@ func (t *table) storeSlow(e *entry) (bool, int) {
 func (t *table) delete(e *entry) (bool, int) {
 	count := 0
 	for true {
-		start := t.jump(e)
-		c := cursor{prev: start}
-		if !c.walk(e) {
-			continue
-		}
+		c := t.cursorFor(e)
 
-		match := c.found(e)
-
-		if match == nil {
+		if !c.find(e) {
 			return false, 0
 		}
 
@@ -493,10 +523,13 @@ func (t *table) delete(e *entry) (bool, int) {
 		}
 
 		if !c.replace_after_prev(c.next) {
-			c.repair_from(start)
+			c.repair_from_start()
 		}
 
-		count = c.count_empty()
+		if c.prev.isDummy() {
+			// check to see if we're the last item
+			count = c.count_empty()
+		}
 
 		break
 	}
@@ -515,6 +548,8 @@ func (t *table) grow(w int) *table {
 	if nt == nil {
 		new_len := 1 << w
 		new_table := make([]atomic.Pointer[entry], new_len)
+		new_table[0].Store(t.start)
+
 		nt = &table{
 			start:   t.start,
 			end:     t.end,
@@ -522,23 +557,94 @@ func (t *table) grow(w int) *table {
 			width:   w,
 			entries: new_table,
 		}
+
+		nt.old.Store(t)
+
+		gap := nt.width - t.width
+
+		if gap > 0 {
+			for i := range t.entries {
+				j := i << gap
+				old := t.entries[i].Load()
+				if old != nil {
+					nt.entries[j].Store(old)
+				}
+			}
+		} else if gap < 0 {
+			for i := range nt.entries {
+				j := i << -gap
+				old := t.entries[j].Load()
+				if old != nil {
+					nt.entries[i].Store(old)
+				}
+			}
+		}
+
 		if !t.new.CompareAndSwap(nil, nt) {
 			nt = t.new.Load()
 		}
 	}
-	gap := nt.width - t.width
-	if gap >= 0 {
-		for i := range t.entries {
-			j := i << gap
-			nt.entries[j].CompareAndSwap(nil, t.entries[i].Load())
+	return nt
+}
+
+func (t *table) sweepOld() {
+	old := t.old.Load()
+	if old == nil {
+		return
+	}
+
+	sentinel := &entry{
+		hash: 1,
+	}
+
+	gap := old.width - t.width
+	if gap <= 0 {
+		t.old.CompareAndSwap(old, nil)
+		return
+	}
+
+	for i := range old.entries {
+		// we mark out every old entry
+		// not just the ones we left behind
+		// as new entries could get added to the old table
+		// and not the new table, and be missed on subsequent sweeps
+
+		o := old.entries[i].Swap(sentinel)
+
+		if o == nil || o.isDeleted() {
+			continue
 		}
-	} else {
-		for i := range nt.entries {
-			j := i << (-gap)
-			nt.entries[i].CompareAndSwap(nil, t.entries[j].Load())
+
+		// if it's an entry we copied over
+		// copy it over again, in case it's new
+
+		j := (i >> gap)
+		if i == (j << gap) {
+			t.entries[j].Store(o)
+			continue
+		}
+
+		// otherwise, time to delete it
+
+		e := &entry{
+			hash: o.hash | 1,
+		}
+		for true {
+			c := o.cursor()
+			if c.ready() {
+				if !c.insert_after_prev(e) {
+					continue
+				}
+			}
+			break
 		}
 	}
-	return nt
+	c := t.start.cursor()
+	if c.ready() {
+		c.findRepair(t.end)
+	}
+
+	t.old.CompareAndSwap(old, nil)
 }
 
 type Map struct {
@@ -547,26 +653,21 @@ type Map struct {
 
 func (m *Map) grow(w int) {
 	t := m.t.Load()
-	if t != nil {
-		new := t.new.Load()
-		if new == nil {
-			go m.tryGrow(w)
-		}
+	if t == nil {
+		return
 	}
 
-}
-
-func (m *Map) waitGrow(w int) {
-	for {
-		t := m.t.Load()
-		if t == nil {
-			break
-		}
-		if t.width == w {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
+	new := t.new.Load()
+	if new != nil {
+		return // already growing
 	}
+
+	old := t.old.Load()
+	if old != nil {
+		return // already growing
+	}
+
+	go m.tryGrow(w)
 }
 
 func (m *Map) tryGrow(w int) {
@@ -575,6 +676,23 @@ func (m *Map) tryGrow(w int) {
 	if new != nil && new != t {
 		m.t.CompareAndSwap(t, new)
 	}
+	new.sweepOld()
+}
+
+func (m *Map) waitGrow(w int) {
+	for {
+		t := m.t.Load()
+		if t == nil {
+			break
+		}
+		if t.old.Load() != nil {
+			continue
+		}
+		if t.width == w {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func (m *Map) fill() {
@@ -582,9 +700,13 @@ func (m *Map) fill() {
 
 	for i := range t.entries {
 		if t.entries[i].Load() == nil {
-			t.jumpSlow(uint64(i))
+			t.insertDummy(uint64(i))
 		}
 	}
+}
+
+func (m *Map) Clear() {
+	m.t.Store(nil)
 }
 
 func (m *Map) table() *table {
@@ -629,7 +751,7 @@ func (m *Map) Load(key string) (value any, ok bool) {
 	}
 
 	if match := t.lookup(&e); match != nil {
-		if match.compare(&e) != 0 || match.deleted() {
+		if match.compare(&e) != 0 || match.isDeleted() {
 			panic("no")
 		}
 		return match.value, true
@@ -666,9 +788,8 @@ func (m *Map) Delete(key string) {
 	}
 
 	_, count := t.delete(e)
-	if count >= 2 {
-		//fmt.Println("empty bucket")
-		//m.grow(t.width -1 )
+	if count >= 4 {
+		m.grow(t.width - 1)
 	}
 }
 func (m *Map) print() {
@@ -679,7 +800,15 @@ func (m *Map) print() {
 	next := t.start
 
 	for next != nil {
-		fmt.Printf("%064b %v:%v\n", next.hash, next.key, next.value)
+		var v string
+		if next.isDummy() {
+			v = ""
+		} else if next.isDeleted() {
+			v = fmt.Sprintf("-%v\n", next.key)
+		} else {
+			v = fmt.Sprintf("+%v:%v", next.key, next.value)
+		}
+		fmt.Printf("%064b %v\n", next.hash, v)
 		next = next.next.Load()
 	}
 }
