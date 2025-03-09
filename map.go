@@ -188,12 +188,12 @@ func (e *entry) compare(o *entry) int {
 	)
 }
 
-func (e *entry) insert_after(value *entry, old *entry) bool {
+func (e *entry) insert_after(old *entry, value *entry) bool {
 	value.next.Store(old)
 	return e.next.CompareAndSwap(old, value)
 }
 
-func (e *entry) replace_next(value *entry, old *entry) bool {
+func (e *entry) replace_next(old *entry, value *entry) bool {
 	return e.next.CompareAndSwap(old, value)
 }
 
@@ -224,11 +224,11 @@ func (e *entry) compact(next *entry) (*entry, *entry) {
 
 	if start != end {
 		if end.isDeleted() {
-			if e.replace_next(next, start) {
+			if e.replace_next(start, next) {
 				end = nil
 			}
 		} else {
-			e.replace_next(end, start)
+			e.replace_next(start, end)
 		}
 	}
 	return end, next
@@ -353,14 +353,14 @@ func (c *cursor) findSlow(needle *entry) bool {
 
 func (c *cursor) insert_after_prev(e *entry) bool {
 	// called after ready()
-	if !c.prev.isDeleted() && c.prev.insert_after(e, c.next) {
+	if !c.prev.isDeleted() && c.prev.insert_after(c.next, e) {
 		return true
 	}
 	return false
 }
 
 func (c *cursor) insert_after_match(e *entry) bool {
-	if !c.match.isDeleted() && c.match.insert_after(e, c.next) {
+	if !c.match.isDeleted() && c.match.insert_after(c.next, e) {
 		// we do not update c.match as we use it
 		// later
 		return true
@@ -368,8 +368,8 @@ func (c *cursor) insert_after_match(e *entry) bool {
 	return false
 }
 
-func (c *cursor) replace_match_with(e *entry) bool {
-	if !c.prev.isDeleted() && c.prev.replace_next(e, c.match) {
+func (c *cursor) replace_after_prev(old *entry, e *entry) bool {
+	if !c.prev.isDeleted() && c.prev.replace_next(old, e) {
 		return true
 	}
 	return false
@@ -584,13 +584,8 @@ func (t *table) insertDummy(index uint64) *entry {
 			continue
 		}
 
-		c3 := cursor{
-			start: c.start,
-			prev:  c.prev,
-			match: inserted,
-		}
 		// best effort eviction
-		c3.replace_match_with(tombstone.next.Load())
+		c.replace_after_prev(inserted, tombstone.next.Load())
 		break
 	}
 
@@ -642,7 +637,7 @@ func (t *table) store(e *entry) (bool, int) {
 		if !c.insert_after_match(e) {
 			return t.storeSlow(e)
 		}
-		if !c.replace_match_with(e) {
+		if !c.replace_after_prev(c.match, e) {
 			c.repair_from_start()
 		}
 	}
@@ -664,7 +659,7 @@ func (t *table) storeSlow(e *entry) (bool, int) {
 				t.pause()
 				continue
 			}
-			if !c.replace_match_with(e) {
+			if !c.replace_after_prev(c.match, e) {
 				c.repair_from_start()
 			}
 		}
@@ -689,7 +684,7 @@ func (t *table) delete(e *entry, maxCount int) (bool, int) {
 			continue
 		}
 
-		if !c.replace_match_with(c.next) {
+		if !c.replace_after_prev(c.match, c.next) {
 			c.repair_from_start()
 		}
 
@@ -1027,11 +1022,11 @@ func (m *Map) Load(key string) (value any, ok bool) {
 
 	match := t.lookup(&e)
 
-	if match.compare(&e) != 0 || match.isDeleted() {
-		panic("bad: lookup returned bad match")
-	}
-
 	if match != nil {
+		if  match.compare(&e) != 0 || match.isDeleted() {
+			panic("bad: lookup returned bad match")
+		}
+
 		return match.value, true
 	}
 	return nil, false
