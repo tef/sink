@@ -354,7 +354,6 @@ func (c *cursor) findSlow(needle *entry) bool {
 func (c *cursor) insert_after_prev(e *entry) bool {
 	// called after ready()
 	if !c.prev.isDeleted() && c.prev.insert_after(e, c.next) {
-		c.match = e
 		return true
 	}
 	return false
@@ -362,14 +361,18 @@ func (c *cursor) insert_after_prev(e *entry) bool {
 
 func (c *cursor) insert_after_match(e *entry) bool {
 	if !c.match.isDeleted() && c.match.insert_after(e, c.next) {
-		c.match = e
+		// we do not update c.match as we use it
+		// later
 		return true
 	}
 	return false
 }
 
-func (c *cursor) replace_after_prev(e *entry) bool {
-	return !c.prev.isDeleted() && c.prev.replace_next(e, c.match)
+func (c *cursor) replace_match_with(e *entry) bool {
+	if !c.prev.isDeleted() && c.prev.replace_next(e, c.match) {
+		return true
+	}
+	return false
 }
 
 func (c *cursor) repair_from_start() bool {
@@ -522,11 +525,8 @@ func (t *table) insertDummy(index uint64) *entry {
 			if c.match != nil && c.match.isDeleted() {
 				// we found a dummy tombstone, so compact
 				// and retry
-				c.prev.compact(nil)
-				continue
-			}
-
-			if c.insert_after_prev(e) {
+				c.repair_from_start()
+			} else if c.insert_after_prev(e) {
 				inserted = e
 				break
 			} else {
@@ -590,7 +590,7 @@ func (t *table) insertDummy(index uint64) *entry {
 			match: inserted,
 		}
 		// best effort eviction
-		c3.replace_after_prev(tombstone.next.Load())
+		c3.replace_match_with(tombstone.next.Load())
 		break
 	}
 
@@ -642,7 +642,7 @@ func (t *table) store(e *entry) (bool, int) {
 		if !c.insert_after_match(e) {
 			return t.storeSlow(e)
 		}
-		if !c.replace_after_prev(e) {
+		if !c.replace_match_with(e) {
 			c.repair_from_start()
 		}
 	}
@@ -664,7 +664,7 @@ func (t *table) storeSlow(e *entry) (bool, int) {
 				t.pause()
 				continue
 			}
-			if !c.replace_after_prev(e) {
+			if !c.replace_match_with(e) {
 				c.repair_from_start()
 			}
 		}
@@ -689,7 +689,7 @@ func (t *table) delete(e *entry, maxCount int) (bool, int) {
 			continue
 		}
 
-		if !c.replace_after_prev(c.next) {
+		if !c.replace_match_with(c.next) {
 			c.repair_from_start()
 		}
 
@@ -1025,10 +1025,13 @@ func (m *Map) Load(key string) (value any, ok bool) {
 		key:  key,
 	}
 
-	if match := t.lookup(&e); match != nil {
-		if match.compare(&e) != 0 || match.isDeleted() {
-			panic("bad: lookup returned bad match")
-		}
+	match := t.lookup(&e)
+
+	if match.compare(&e) != 0 || match.isDeleted() {
+		panic("bad: lookup returned bad match")
+	}
+
+	if match != nil {
 		return match.value, true
 	}
 	return nil, false
@@ -1067,6 +1070,7 @@ func (m *Map) Delete(key string) {
 		m.resize(t.width, t.width-1)
 	}
 }
+
 func (m *Map) print() {
 	t := m.table()
 
