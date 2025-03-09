@@ -35,7 +35,7 @@ func (e *Executor) Go(f func()) {
 	}()
 }
 
-func TestMap(t *testing.T) {
+func TestMapSimple(t *testing.T) {
 	m := &Map{}
 	m.Store("key", 123)
 	v, ok := m.Load("key")
@@ -59,14 +59,30 @@ func TestMapGrow(t *testing.T) {
 		}
 	}
 
-	t.Log("grow 4")
-	m.grow(4)
+	t.Log("waiting on resize")
+	m.waitResize()
+	t.Log("done waiting on resize")
+
+	tb := m.table()
+	t.Log("tryGrow 4 from",tb.width, "on version", tb.version)
+	m.tryResize(tb.width, 4)
+	tb = m.table()
+	t.Log("after tryGrow 4 from",tb.width, "on version", tb.version)
+	if tb.width < 4 {
+		t.Fatal("fail: tryGrow 4 from",tb.width, "on", tb.version)
+	}
+	tb = m.table()
+	t.Log("waitGrow 4 from",tb.width, "on version", tb.version)
 	m.waitGrow(4)
+	t.Log("after waitGrow 4 from",tb.width, "on version", tb.version)
 	m.fill()
 
+	tb = m.table()
 	t.Log("shrink 2")
-	m.grow(2)
-	m.waitGrow(2)
+	m.tryResize(tb.width, 2)
+	t.Log("shrink 2: wait")
+	m.waitShrink(2)
+	t.Log("shrink 2: fill")
 	m.fill()
 	m.print()
 
@@ -74,7 +90,7 @@ func TestMapGrow(t *testing.T) {
 
 	ex := Executor{fake: false}
 
-	n := 65535 << 6
+	n := 65535 << 5
 
 	for i := 0; i < n; i++ {
 		ex.Go(func() {
@@ -91,6 +107,7 @@ func TestMapGrow(t *testing.T) {
 	t.Log("waiting on first wave")
 	ex.Wait()
 
+	t.Log(m.table().width)
 	t.Log("second wave")
 
 	ex = Executor{fake: false}
@@ -112,7 +129,7 @@ func TestMapGrow(t *testing.T) {
 			key := fmt.Sprint(i)
 			ok := true
 			for ok {
-				time.Sleep(5 * time.Millisecond)
+				time.Sleep(100 * time.Millisecond)
 				_, ok = m.Load(key)
 			}
 		})
@@ -128,10 +145,11 @@ func TestMapGrow(t *testing.T) {
 	} else {
 		t.Logf("lookup: %v", v)
 	}
-	t.Log("done")
-	t.Log(m.table().width)
-	m.grow(0)
-	m.waitGrow(0)
+	m.waitResize()
+	tb = m.table()
+	t.Log("done, shrinking from", tb)
+	m.resize(tb.width, 0)
+	m.waitShrink(0)
 	t.Log(m.table().width)
 	m.print()
 
