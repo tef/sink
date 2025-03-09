@@ -10,22 +10,43 @@ package xsync
 //     start, a1, b1, end
 // ```
 //
-// the list is a bit mvcc: we always insert a new entry to make a change,
-// either the newer version or a tombstone. once inserted, we go back
-// and clean up the list. for example, we can have multiple versions of an
-// entry, but a tombstone is always the last version if present:
+// to insert new versions, we add them to the list, and for deletes
+// we insert a tombstone. all new items come after the old ones:
 //
 // ```
 //     start, a1, a2, b1, bX, c1, c2, c3, end
+// ```
+//
+// once we've inserted the new versions, we can trim out the old
+// versions from the list:
+//
+// ```
 //     start, a2, c3, end
 // ```
 //
-// when we search through the list, the first matching entry may
-// not be the most recent version, and so we must continue searching
-// through until the last matching entry.  this might seem a little
-// excessive, but we have good reason.
+// this means that lookups must search for the last matching item
+// in the list, rather than the first.
 //
-// we can do all of the above in a lock free manner:
+// it might seem a little weird, but we have good reasons for it.
+//
+// with a concurrent linked list, it's easy to add new items lock-free
+// but deleting items from a list can be much harder:
+//
+// ```
+//     start, a1, aX, end
+//     start, a1, aX, b1, end // must not happen
+//     start, end // what must happen before inserts
+// ```
+//
+// when we delete items from the list, we copy over aX's next pointer
+// into start, and if another thread tries to insert after aX, it
+// might happen after aX has been removed from the list.
+//
+// to prevent this, we do not allow entries to be inserted after tombstones
+// and require all new versions to be added after old ones, effectively
+// freezing those next pointers from changes.
+//
+// more formally:
 //
 // - it's always safe to read an item once it's in the list,
 //   as only the next pointer can change
@@ -37,34 +58,42 @@ package xsync
 // - as old versions and tombstones have frozen next pointers, we can
 //   patch them out of the list, without worrying about other threads
 //
-// the usual problem is that another thread updates the next pointer
-// of the node you're deleting, but only after you update the predecessor to
-// exclude it. this leaves a new item dangling without anyone knowing.
+// alongside the linked-list, we keep a lookup table of special entries
+// throughout the list:
 //
-// freezing the next pointer prevents any lost updates. essentially it
-// acts as both a lock on the key, and a lock over the gap between it
-// and the next key.
+// ```
+//     start --> 0 --> 0xxx... ---> 1 -->  1xxx... ---> end
+// ```
 //
-// ... but wait, there's more!
+// when we search the list, we take the prefix of the hash we're looking
+// for, and use the lookup table to jump further into the list.
 //
-// in order to speed up operations on the list, we keep a
-// series of dummy entries in the list, and a lookup table
-// pointing to them. this allows us to jump deeply into the
-// linked list, avoiding substantial amounts of searching
+// when the list gets too big, we create new dummy entries inside the list
+// and create a new, larger lookup table, reusing the older entries:
 //
-// for example: a three bit jump table has eight dummy entries in the list
-// for all possible three bit prefixes of a hash.
+// ```
+// start -> 00         -> 01         -> 10         -> 11         -> end
+// start -> 000 -> 001 -> 010 -> 011 -> 100 -> 101 -> 110 -> 111 -> end
+// ```
 //
-//     `000 -> 001 -> 010 -> 011 -> 100 -> 101 -> 110 -> 111`
+// we grow the table when it takes more than some N entries to find
+// an item. when we delete an entry, we check to see if there's any
+// items before, or after the now removed element, and if we find
+// two dummy items afterwards, we shrink the table in half.
 //
-// the jump table is all the dummy entries in order, and
-// when we resize the array, we copy across the old dummy entries
-// into their new positions.
+// i.e if we delete X from `00 --> X -- > 01 --> 10...`  we
+// can infer that the `00-->01` and `01 --> 10` stretches are empty
+// and shrink the jump table.
 //
+// growing and shrinking a jump table can be done concurrently
+// as readers can use earlier items in the table if the desired
+// entry is missing,
 //
 // nb: this strucure is very similar to, and directly inspired by:
-//
 // "Split-Ordered Lists: Lock-Free Extensible Hash Tables"
+//
+// the paper also uses a lock-free linked list and a jump table
+// to speed up searches
 //
 // the key differences are:
 //
@@ -85,14 +114,12 @@ package xsync
 // and keeping things in lexicographic order means that we can
 // handle missing jump entries with very little fuss.
 //
+// we also use different logic to manage splitting and growing.
+//
 // in some ways, this is a simplification (no pointer tagging, no bithacks)
 // but in others, it's a complication (read until last match, tombstones)
 //
 // c'est la vie
-//
-//
-// TODO: growing when inserting at end of long chain
-//       or shrinking when buckets touch
 
 import (
 	"cmp"
