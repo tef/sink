@@ -424,7 +424,6 @@ func (t *table) cursorFor(e *entry) cursor {
 	}
 	c := start.cursor()
 
-
 	if !c.ready() {
 		nt := t.new.Load()
 		if nt != nil {
@@ -432,7 +431,7 @@ func (t *table) cursorFor(e *entry) cursor {
 		}
 
 		// we found a dummy, but there's a tombstone next to it(?!)
-		// this means that 
+		// this means that
 		// (a) we're growing after a shrink, and the entry wasn't compacted
 		// (b) someone else inserted a dummy into the list, only to find the table expunged
 		//     and so inserted a tombstone, which hasn't been expunged
@@ -449,7 +448,6 @@ func (t *table) cursorFor(e *entry) cursor {
 	if start.compare(e) > 0 {
 		panic("bad")
 	}
-
 
 	return c
 }
@@ -539,7 +537,7 @@ func (t *table) insertDummy(index uint64) *entry {
 
 	// nt := t.new.Load()
 	// nt.repairDummyInsert(e)
-		
+
 	// XXX: maybe try insert if new table exists
 	// XXX: only delete if we're shrinking
 
@@ -561,7 +559,6 @@ func (t *table) insertDummy(index uint64) *entry {
 			return t.expunged
 		}
 	}
-
 
 	return e
 }
@@ -670,12 +667,12 @@ func (t *table) resize(from int, to int) *table {
 		new_table[0].Store(t.start)
 
 		nt = &table{
-			version: t.version + 1,
-			start:   t.start,
-			end:     t.end,
-			seed:    t.seed,
-			width:   to,
-			entries: new_table,
+			version:  t.version + 1,
+			start:    t.start,
+			end:      t.end,
+			seed:     t.seed,
+			width:    to,
+			entries:  new_table,
 			expunged: t.expunged,
 		}
 
@@ -832,7 +829,7 @@ func (m *Map) tryResize(from int, to int) {
 	if nt == nil || nt == t {
 		return
 	}
-	if nt.version != t.version + 1 {
+	if nt.version != t.version+1 {
 		panic("what???")
 	}
 	if m.t.CompareAndSwap(t, nt) {
@@ -933,11 +930,11 @@ func (m *Map) table() *table {
 	}
 
 	t = &table{
-		seed:    maphash.MakeSeed(),
-		start:   start,
-		end:     end,
-		width:   0,
-		entries: entries,
+		seed:     maphash.MakeSeed(),
+		start:    start,
+		end:      end,
+		width:    0,
+		entries:  entries,
 		expunged: expunged,
 	}
 
@@ -979,7 +976,7 @@ func (m *Map) Store(key string, value any) {
 		panic("bad: failed to insert into map")
 	}
 	if count > 8 {
-		m.resize(t.width, t.width + 1)
+		m.resize(t.width, t.width+1)
 	}
 }
 func (m *Map) Delete(key string) {
@@ -994,7 +991,7 @@ func (m *Map) Delete(key string) {
 
 	_, count := t.delete(e)
 	if count >= 4 {
-		m.resize(t.width, t.width - 1)
+		m.resize(t.width, t.width-1)
 	}
 }
 func (m *Map) print() {

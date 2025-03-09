@@ -64,17 +64,17 @@ func TestMapGrow(t *testing.T) {
 	t.Log("done waiting on resize")
 
 	tb := m.table()
-	t.Log("tryGrow 4 from",tb.width, "on version", tb.version)
+	t.Log("tryGrow 4 from", tb.width, "on version", tb.version)
 	m.tryResize(tb.width, 4)
 	tb = m.table()
-	t.Log("after tryGrow 4 from",tb.width, "on version", tb.version)
+	t.Log("after tryGrow 4 from", tb.width, "on version", tb.version)
 	if tb.width < 4 {
-		t.Fatal("fail: tryGrow 4 from",tb.width, "on", tb.version)
+		t.Fatal("fail: tryGrow 4 from", tb.width, "on", tb.version)
 	}
 	tb = m.table()
-	t.Log("waitGrow 4 from",tb.width, "on version", tb.version)
+	t.Log("waitGrow 4 from", tb.width, "on version", tb.version)
 	m.waitGrow(4)
-	t.Log("after waitGrow 4 from",tb.width, "on version", tb.version)
+	t.Log("after waitGrow 4 from", tb.width, "on version", tb.version)
 	m.fill()
 
 	tb = m.table()
