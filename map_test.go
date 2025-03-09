@@ -74,7 +74,7 @@ func TestMapGrow(t *testing.T) {
 
 	ex := Executor{fake: false}
 
-	n := 65535 << 5
+	n := 65535 << 6
 
 	for i := 0; i < n; i++ {
 		ex.Go(func() {
@@ -130,8 +130,8 @@ func TestMapGrow(t *testing.T) {
 	}
 	t.Log("done")
 	t.Log(m.table().width)
-	m.grow(1)
-	m.waitGrow(1)
+	m.grow(0)
+	m.waitGrow(0)
 	t.Log(m.table().width)
 	m.print()
 

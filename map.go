@@ -136,10 +136,14 @@ const hash_mask = 0xFFFF_FFFF_FFFF_FFF0
 const entry_mask = 2
 const tombstone_mask = 3
 
+// we store some flags inside of the `hash` field of `entry`:
+//
 // bit 0 is deleted, bit 1 is real/placeholder, bit 2 is sentinel
-// so 000 = dummy item
-//    010, 011, real item, deleted
-//    1xx = end sentinel value
+// so 0000, dummy item
+//    0001, dummy tombstone
+//    0010, real item,
+//    0000, real tombstone
+//    1110, end sentinel value
 
 type entry struct {
 	hash  uint64
@@ -236,10 +240,13 @@ type cursor struct {
 }
 
 func (c *cursor) ready() bool {
+	if c.start == nil || c.start.isDeleted() {
+		return false
+	}
 	if c.prev == nil {
 		c.prev = c.start
 	}
-	if c.prev == nil {
+	if c.prev == nil || c.prev.isDeleted() {
 		return false
 	}
 
@@ -625,10 +632,6 @@ func (t *table) sweepOld() {
 	}
 
 	gap := old.width - t.width
-	if gap <= 0 {
-		t.old.CompareAndSwap(old, nil)
-		return
-	}
 
 	for i := range old.entries {
 		// we mark out every old entry
@@ -644,6 +647,17 @@ func (t *table) sweepOld() {
 
 		// if it's an entry we copied over
 		// copy it over again, in case it's new
+
+		// if we're growing, we have nothing to sweep
+		if gap <= 0 {
+			j := i << -gap
+			t.entries[j].Store(o)
+			continue
+
+		}
+
+		// if we're shrinking, then we copy over
+		// or sweep
 
 		j := (i >> gap)
 		if i == (j << gap) {
@@ -684,13 +698,14 @@ func (m *Map) grow(w int) {
 		return
 	}
 
-	new := t.new.Load()
-	if new != nil {
-		return // already growing
-	}
-
 	old := t.old.Load()
 	if old != nil {
+		// go t.sweepOld()
+		return // already shrinking
+	}
+
+	new := t.new.Load()
+	if new != nil {
 		return // already growing
 	}
 
