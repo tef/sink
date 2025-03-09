@@ -90,7 +90,7 @@ func TestMapGrow(t *testing.T) {
 
 	ex := Executor{fake: false}
 
-	n := 65535 << 5
+	n := 65535 << 7
 
 	for i := 0; i < n; i++ {
 		ex.Go(func() {
@@ -125,7 +125,7 @@ func TestMapGrow(t *testing.T) {
 			m.Delete(key)
 		})
 		ex2.Go(func() {
-			time.Sleep(1 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 			key := fmt.Sprint(i)
 			ok := true
 			for ok {
@@ -147,7 +147,7 @@ func TestMapGrow(t *testing.T) {
 	}
 	m.waitResize()
 	tb = m.table()
-	t.Log("done, shrinking from", tb)
+	t.Log("done, shrinking from", tb.width)
 	m.resize(tb.width, 0)
 	m.waitShrink(0)
 	t.Log(m.table().width)

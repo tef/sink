@@ -89,6 +89,19 @@ package xsync
 // as readers can use earlier items in the table if the desired
 // entry is missing,
 //
+// this does mean handling some weird cases
+//
+// - a dummy entry is inserted, but must be deleted as the table is being evicted
+// - the table has been shrunk then grown, and so another thread sees the dummy
+//   and inserts it into the table
+// - the older thread gasps and goes "uh oh" and drops the item
+// - the newer thread now has a tombstone'd waypoint in the array
+//
+// if we used epochs, and waited for old readers before shrinking/growing
+// we'd avoid this problem altogether, but it's not really that annoying
+// to clear out and reinsert items upon errors
+//
+//
 // nb: this strucure is very similar to, and directly inspired by:
 // "Split-Ordered Lists: Lock-Free Extensible Hash Tables"
 //
@@ -129,6 +142,9 @@ import (
 	"time"
 )
 
+const maxInsertCount = 12 // length of search before suggesting grow
+const maxEmptyDummy = 6   // number of empty dummy sections found after delete before suggesting shrink
+
 const uint64w = 64
 const hashBits = 56 // width of uint64 - flag nibble
 
@@ -146,7 +162,7 @@ const tombstone_mask = 3
 //    1110, end sentinel value
 
 func spin() {
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
 }
 
 type entry struct {
@@ -244,6 +260,8 @@ type cursor struct {
 }
 
 func (c *cursor) ready() bool {
+	// is there no tombstone following this dummy entry?
+
 	if c.start == nil || c.start.isDeleted() {
 		return false
 	}
@@ -338,6 +356,8 @@ func (c *cursor) findRepair(needle *entry) bool {
 }
 
 func (c *cursor) repair_from_start() bool {
+	// compact every entry from start to next
+
 	slow := c.start.cursor()
 
 	if !slow.ready() {
@@ -364,15 +384,16 @@ func (c *cursor) replace_after_prev(e *entry) bool {
 	return !c.prev.isDeleted() && c.prev.replace_next(e, c.match)
 }
 
-func (c *cursor) count_empty() int {
-	// check the next for dummy entries
+func (c *cursor) count_empty(n int) int {
+	// check the next entries for dummy entries
+	// which is used by delete to know when to shrink
+
+	count := 0
 	if !c.next.isDummy() {
 		return 0
 	}
-
-	count := 1
 	next := c.next.next.Load()
-	for next != nil && next.isDummy() {
+	for next != nil && next.isDummy() && count < n {
 		next = next.next.Load()
 		count += 1
 
@@ -406,47 +427,47 @@ func (t *table) tombstone_hash(key string) uint64 {
 	return (hash & hash_mask) | tombstone_mask
 }
 
-func (t *table) cursorFor(e *entry) cursor {
+func (t *table) startPoint(e *entry) cursor {
 	index := e.hash >> (uint64w - t.width)
+	var c cursor
 
-	start := t.entries[index].Load()
-	if start == nil {
-		start = t.insertDummy(index)
-	}
-
-	if start == t.expunged {
-		// the table has been expunged
-		nt := t.new.Load()
-		if nt == nil {
-			panic("expunged entries, no new table")
+	for true {
+		start := t.entries[index].Load()
+		if start == nil {
+			start = t.insertDummy(index)
 		}
-		return nt.cursorFor(e)
-	}
-	c := start.cursor()
 
-	if !c.ready() {
-		nt := t.new.Load()
-		if nt != nil {
-			return nt.cursorFor(e)
+		if start != nil && start != t.expunged {
+			if start.compare(e) > 0 {
+				panic("bad")
+			}
+
+			c = start.cursor()
+
+			if c.ready() {
+				break
+			}
 		}
 
 		// we found a dummy, but there's a tombstone next to it(?!)
-		// this means that
-		// (a) we're growing after a shrink, and the entry wasn't compacted
-		// (b) someone else inserted a dummy into the list, only to find the table expunged
-		//     and so inserted a tombstone, which hasn't been expunged
+		// or when we tried to insert, a previous dummy had a tombstone
 
-		// if it's (a), retrying will find the expunged item, and the new value
-		// if it's (b), we cannot manage it
+		// we could be being expunged, so we forward the lookup:
 
-		// XXX: fix this
+		nt := t.new.Load()
+		if nt != nil {
+			return nt.startPoint(e)
+		}
 
-		panic("super bad: found a tombstoned dummy in the jump table")
+		// alas, if we're the most recent table, someone has decided to
+		// evict the dummy entry, so we must clear the entry
 
-	}
+		if start != nil && start != t.expunged {
+			t.entries[index].CompareAndSwap(start, nil)
+		}
 
-	if start.compare(e) > 0 {
-		panic("bad")
+		// and insertDummy will compact it and try again
+		spin()
 	}
 
 	return c
@@ -463,8 +484,7 @@ func (t *table) insertDummy(index uint64) *entry {
 	}
 
 	start = t.insertDummy(index - 1)
-
-	if start == t.expunged {
+	if start == t.expunged || start == nil {
 		return start
 	}
 
@@ -474,47 +494,56 @@ func (t *table) insertDummy(index uint64) *entry {
 		hash: hash,
 	}
 
-	old := t.entries[index].Load()
-
-	if old != nil { // or expunged
-		return old
-	}
-
 	var c cursor
+	var old *entry
+	var inserted *entry
 
 	for true {
-		c = start.cursor()
-
-		if c.ready() {
-			if c.findRepair(e) {
-				return c.match
-			}
-
-			if c.match != nil && c.match.isDeleted() {
-				panic("bad: can't insert, dummy exists, we found its tombstone")
-				// XXX: we could remove it, and retry
-			}
-
-			if c.insert_after_prev(e) {
-				break
-			}
-		} else {
-			// our start point has been deleted with a tombstone, after
-			// we loaded it, but our entry hasn't been expunged
-
-			panic("bad: can't insert dummy, start point is tombstoned")
-
-		}
-
-		// insert failed, check the table again
+		// check before inserting that it's still empty
 		old = t.entries[index].Load()
 
 		if old != nil { // or expunged
 			return old
 		}
+
+		c = start.cursor()
+
+		if c.ready() {
+			// someone else already put it in the list, so we use it
+			// and try to insert it into the table (we're helping!)
+
+			if c.findRepair(e) {
+				e = c.match
+				break
+			}
+
+			if c.match != nil && c.match.isDeleted() {
+				// we found a dummy tombstone, so compact
+				c.prev.compact(nil)
+				continue
+			}
+
+			if c.insert_after_prev(e) {
+				inserted = e
+				break
+			}
+		} else {
+			// our start point has been deleted with a tombstone, after
+			// we loaded it, but our table is not being expunged
+
+			// ... so clear it out, and try again
+
+			t.entries[index].CompareAndSwap(start, nil)
+
+			start = t.insertDummy(index - 1)
+			if start == t.expunged || start == nil {
+				return start
+			}
+		}
 	}
 
-	// insert succeded, table still empty
+	// insert/lookup succeded, table still empty
+
 	for true {
 		if t.entries[index].CompareAndSwap(nil, e) {
 			return e
@@ -533,38 +562,73 @@ func (t *table) insertDummy(index uint64) *entry {
 		}
 	}
 
-	// our table is being evicted
+	// our table is being expunged
 
-	// nt := t.new.Load()
-	// nt.repairDummyInsert(e)
-
-	// XXX: maybe try insert if new table exists
-	// XXX: only delete if we're shrinking
-
-	tombstone := &entry{hash: e.hash | 1}
-	for true {
-		c2 := e.cursor()
-		if !c2.ready() {
-			return t.expunged
-		}
-		if c2.insert_after_prev(tombstone) {
-			fmt.Println("dummy tombstone")
-			c3 := cursor{
-				start: c.start,
-				prev:  c.prev,
-				match: e,
-			}
-			c3.replace_after_prev(tombstone.next.Load())
-			fmt.Println("cleared!")
-			return t.expunged
-		}
+	if inserted == nil {
+		return t.expunged
 	}
 
-	return e
+	// we inserted, but our table is being evicted
+	// so we must delete and evict our insert
+	// or find a home for it in the new table
+
+	nt := t.new.Load()
+	if nt.repairDummyInsert(inserted) {
+		// it's valid, so we just make progress
+		return e
+	}
+
+	tombstone := &entry{hash: inserted.hash | 1}
+	for true {
+		c2 := inserted.cursor()
+		if !c2.ready() {
+			break
+		}
+
+		if !c2.insert_after_prev(tombstone) {
+			spin()
+			continue
+		}
+
+		c3 := cursor{
+			start: c.start,
+			prev:  c.prev,
+			match: inserted,
+		}
+		// best effort eviction
+		c3.replace_after_prev(tombstone.next.Load())
+		break
+	}
+
+	return t.expunged
+}
+
+func (t *table) repairDummyInsert(e *entry) bool {
+	nt := t.new.Load()
+	if nt != nil {
+		return nt.repairDummyInsert(e)
+	}
+
+	index := e.hash >> (uint64w - t.width)
+	hash := index << (uint64w - t.width)
+
+	if e.hash != hash {
+		return false
+	}
+
+	start := t.entries[index].Load()
+	if start == e {
+		return true
+	} else if start == nil && t.entries[index].CompareAndSwap(nil, e) {
+		return true
+	}
+
+	start = t.entries[index].Load()
+	return start == e
 }
 
 func (t *table) lookup(e *entry) *entry {
-	c := t.cursorFor(e)
+	c := t.startPoint(e)
 
 	if c.find(e) {
 		return c.match
@@ -574,7 +638,7 @@ func (t *table) lookup(e *entry) *entry {
 }
 
 func (t *table) store(e *entry) (bool, int) {
-	c := t.cursorFor(e)
+	c := t.startPoint(e)
 
 	if !c.find(e) {
 		if !c.insert_after_prev(e) {
@@ -594,7 +658,7 @@ func (t *table) store(e *entry) (bool, int) {
 
 func (t *table) storeSlow(e *entry) (bool, int) {
 	for true {
-		c := t.cursorFor(e)
+		c := t.startPoint(e)
 
 		if !c.find(e) {
 			if !c.insert_after_prev(e) {
@@ -617,10 +681,10 @@ func (t *table) storeSlow(e *entry) (bool, int) {
 	return false, -1
 }
 
-func (t *table) delete(e *entry) (bool, int) {
+func (t *table) delete(e *entry, maxCount int) (bool, int) {
 	count := 0
 	for true {
-		c := t.cursorFor(e)
+		c := t.startPoint(e)
 
 		if !c.find(e) {
 			return false, 0
@@ -637,7 +701,7 @@ func (t *table) delete(e *entry) (bool, int) {
 
 		if c.prev.isDummy() {
 			// check to see if we're the last item
-			count = c.count_empty()
+			count = c.count_empty(maxCount-1) + 1
 		}
 
 		break
@@ -715,13 +779,11 @@ func (t *table) sweepOld() {
 
 	gap := old.width - t.width
 
-	fmt.Printf("sweeping v%d's old (v%d), from %d to %d\n", t.version, old.version, old.width, t.width)
+	// fmt.Printf("sweeping v%d's old (v%d), from %d to %d\n", t.version, old.version, old.width, t.width)
 
 	for i := range old.entries {
-		// we mark out every old entry
-		// not just the ones we left behind
-		// as new entries could get added to the old table
-		// and not the new table, and be missed on subsequent sweeps
+		// we mark out every old entry, even ones we copied over
+		// to stop new entries being added to the old table
 
 		o := old.entries[i].Swap(sentinel)
 
@@ -729,27 +791,26 @@ func (t *table) sweepOld() {
 			continue
 		}
 
-		// if it's an entry we copied over
-		// copy it over again, in case it's new
+		// if we're growing, we copy over
+		// the old entry again, just in case
 
-		// if we're growing, we have nothing to sweep
 		if gap <= 0 {
 			j := i << -gap
-			t.entries[j].Store(o)
+			t.entries[j].CompareAndSwap(nil, o)
 			continue
 
 		}
 
-		// if we're shrinking, then we copy over
-		// or sweep
+		// if we're shrinking, then we copy
+		// over the matching items
 
 		j := (i >> gap)
 		if i == (j << gap) {
-			t.entries[j].Store(o)
+			t.entries[j].CompareAndSwap(nil, o)
 			continue
 		}
 
-		// otherwise, time to delete it
+		// ... and clear out old dummy entries
 
 		e := &entry{
 			hash: o.hash | 1,
@@ -761,7 +822,7 @@ func (t *table) sweepOld() {
 					spin()
 					continue
 				}
-				fmt.Println("tombstone")
+				//fmt.Println("tombstone")
 			}
 			break
 		}
@@ -781,7 +842,7 @@ func (t *table) sweepOld() {
 		spin()
 	}
 
-	fmt.Printf("done sweeping v%d's old (v%d), clearing old\n", t.version, old.version)
+	// fmt.Printf("done sweeping v%d's old (v%d), clearing old\n", t.version, old.version)
 
 }
 
@@ -815,17 +876,17 @@ func (m *Map) tryResize(from int, to int) {
 
 	old := t.old.Load()
 	if old != nil {
-		fmt.Println("skip: sweeping")
-		return // still sweeping old
+		go t.sweepOld()
+		return // still sweeping old, so help
 	}
 
 	new := t.new.Load()
 	if new != nil {
-		fmt.Println("skip: growing")
 		return // already growing
 	}
 
 	nt := t.resize(from, to)
+
 	if nt == nil || nt == t {
 		return
 	}
@@ -833,7 +894,7 @@ func (m *Map) tryResize(from int, to int) {
 		panic("what???")
 	}
 	if m.t.CompareAndSwap(t, nt) {
-		fmt.Printf("new table is v%d\n", nt.version)
+		// fmt.Printf("new table is v%d\n", nt.version)
 		nt.sweepOld()
 	}
 }
@@ -954,7 +1015,7 @@ func (m *Map) Load(key string) (value any, ok bool) {
 
 	if match := t.lookup(&e); match != nil {
 		if match.compare(&e) != 0 || match.isDeleted() {
-			panic("no")
+			panic("bad: lookup returned bad match")
 		}
 		return match.value, true
 	}
@@ -975,7 +1036,7 @@ func (m *Map) Store(key string, value any) {
 	if !ok {
 		panic("bad: failed to insert into map")
 	}
-	if count > 8 {
+	if count > maxInsertCount {
 		m.resize(t.width, t.width+1)
 	}
 }
@@ -989,15 +1050,15 @@ func (m *Map) Delete(key string) {
 		key:  key,
 	}
 
-	_, count := t.delete(e)
-	if count >= 4 {
+	_, count := t.delete(e, maxEmptyDummy)
+	if count >= maxEmptyDummy {
 		m.resize(t.width, t.width-1)
 	}
 }
 func (m *Map) print() {
 	t := m.table()
 
-	fmt.Println("table", t.width)
+	fmt.Println("table", t.width, "version", t.version)
 
 	next := t.start
 
