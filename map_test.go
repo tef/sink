@@ -56,12 +56,25 @@ func TestMapBasic(t *testing.T) {
 		t.Logf("lookup: %v", v)
 	}
 
-	m.Delete("key")
-	v, ok = m.Load("key")
-	if ok {
+	old, ok := m.LoadAndDelete("key")
+	if !ok {
+		t.Fatal("missing")
+	} else if old.(int) != 456 {
 		t.Fatal("wrong", v)
 	} else {
+		t.Logf("load and delete: %v", v)
+	}
+
+	v, ok = m.Load("key")
+	if ok {
+		t.Fatal("not deleted", v)
+	} else {
 		t.Logf("deleted")
+	}
+
+	old, ok = m.LoadAndDelete("key")
+	if ok {
+		t.Fatal("not deleted")
 	}
 
 }

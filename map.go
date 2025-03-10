@@ -196,6 +196,8 @@ const hash_mask = ^uintH(15)
 const entry_mask = 2
 const tombstone_mask = 3
 
+type conditionFunc func(old *entry, new *entry) bool
+
 type entry struct {
 	hash  uintH
 	key   string
@@ -694,59 +696,70 @@ func (t *table) lookup(e *entry) *entry {
 	return nil
 }
 
-func (t *table) store(e *entry) (*entry, bool) {
+func (t *table) store(e *entry, shouldGrow *bool) (old *entry) {
 	c := t.waypointFor(e)
 
-	if !c.find(e) {
+	found := c.find(e)
+
+	if !found {
 		if !c.insert_after_prev(e) {
-			return t.storeSlow(e)
+			return t.storeSlow(e, shouldGrow)
 		}
-		return e, c.count > t.growInsertCount
+		*shouldGrow = c.count > t.growInsertCount
+		return nil
 	} else {
 		if !c.insert_after_match(e) {
-			return t.storeSlow(e)
+			return t.storeSlow(e, shouldGrow)
 		}
 		if !c.replace_after_prev(c.match, e) {
 			c.repair_from_start()
 		}
-		return e, false
+		return c.match
 	}
 
 }
 
-func (t *table) storeSlow(e *entry) (*entry, bool) {
+func (t *table) storeSlow(e *entry, shouldGrow *bool)  (old *entry) {
+
 	var c cursor
+
 	for true {
 		c = t.waypointFor(e)
 
-		if !c.findSlow(e) {
+		found := c.findSlow(e)
+
+		if !found { 
 			if !c.insert_after_prev(e) {
 				t.pause()
 				continue
-			}
-		} else {
-			if !c.insert_after_match(e) {
-				t.pause()
-				continue
-			}
-			if !c.replace_after_prev(c.match, e) {
-				c.repair_from_start()
-			}
+			} 
+			*shouldGrow = c.count > t.growInsertCount
+			return nil
+		} 
+
+		// found an old version
+
+		if !c.insert_after_match(e) {
+			t.pause()
+			continue
+		}
+
+		if !c.replace_after_prev(c.match, e) {
+			c.repair_from_start()
 		}
 		break
 	}
+	return c.match
 
-	return e, c.count > t.growInsertCount
 }
 
-func (t *table) delete(e *entry) (*entry, bool) {
-	count := 0
+func (t *table) delete(e *entry, shouldShrink *bool) *entry {
 	var deleted *entry
 	for true {
 		c := t.waypointFor(e)
 
 		if !c.find(e) {
-			return nil, false
+			return nil
 		}
 
 		deleted = c.match
@@ -762,13 +775,13 @@ func (t *table) delete(e *entry) (*entry, bool) {
 
 		if c.prev.isWaypoint() {
 			// check to see if we're the last item
-			count = c.count_empty_successors(t.shrinkEmptyCount-1) + 1
+			count := c.count_empty_successors(t.shrinkEmptyCount-1) + 1
+			*shouldShrink = count >= t.shrinkEmptyCount
 		}
 
 		break
 	}
-
-	return deleted, count >= t.shrinkEmptyCount
+	return deleted
 }
 
 func (t *table) resize(from int, to int) *table {
@@ -958,6 +971,7 @@ type Map struct {
 	ShrinkEmptyCount int
 }
 
+
 func (m *Map) table() *table {
 	t := m.t.Load()
 	if t != nil {
@@ -1090,15 +1104,14 @@ func (m *Map) Store(key string, value any) {
 		value: value,
 	}
 
-	inserted, shouldGrow := t.store(e)
+	var shouldGrow bool
+	t.store(e, &shouldGrow)
 
-	if inserted == nil {
-		panic("bad: failed to insert into map")
-	}
 	if shouldGrow {
 		m.resize(t.width, t.width+1)
 	}
 }
+
 func (m *Map) Delete(key string) {
 	t := m.table()
 	hash := t.tombstone_hash(key)
@@ -1108,11 +1121,35 @@ func (m *Map) Delete(key string) {
 		key:  key,
 	}
 
-	_, shouldShrink := t.delete(e)
+	var shouldShrink bool
+
+	t.delete(e, &shouldShrink)
 	if shouldShrink {
 		m.resize(t.width, t.width-1)
 	}
 }
+func (m *Map) LoadAndDelete(key string) (value any, loaded bool) {
+	t := m.table()
+	hash := t.tombstone_hash(key)
+
+	e := &entry{
+		hash: hash,
+		key:  key,
+	}
+
+	var shouldShrink bool
+
+	deleted := t.delete(e, &shouldShrink)
+
+	if shouldShrink {
+		m.resize(t.width, t.width-1)
+	}
+	if deleted != nil {
+		return deleted.value, true
+	}
+	return nil, false
+}
+
 func (m *Map) Range(f func(key string, value any) bool) {
 	t := m.table()
 
@@ -1145,7 +1182,6 @@ func (m *Map) Range(f func(key string, value any) bool) {
    Swap(key, value any) (previous any, loaded bool)
 
    CompareAndDelete(key, old any) (deleted bool)
-   LoadAndDelete(key any) (value any, loaded bool)
    LoadOrStore(key, value any) (actual any, loaded bool)
 
 */
