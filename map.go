@@ -323,7 +323,7 @@ func (c *cursor) ready() bool {
 	return true
 }
 
-func (c *cursor) find(needle *entry) bool {
+func (c *cursor) find(needle *entry) *entry {
 	// always called on a ready entry
 	var prev_match, match, next *entry
 
@@ -354,10 +354,14 @@ func (c *cursor) find(needle *entry) bool {
 	c.next = next
 	c.count = count
 
-	return c.match != nil && !c.match.isDeleted()
+	if c.match != nil && !c.match.isDeleted() {
+		return c.match
+	} else {
+		return nil
+	}
 }
 
-func (c *cursor) findSlow(needle *entry) bool {
+func (c *cursor) findSlow(needle *entry) *entry {
 	// always called on a ready entry
 	var prev_match, match, prev_next, next, after *entry
 
@@ -395,7 +399,11 @@ func (c *cursor) findSlow(needle *entry) bool {
 	c.next = next
 	c.count = count
 
-	return c.match != nil && !c.match.isDeleted()
+	if c.match != nil && !c.match.isDeleted() {
+		return c.match
+	} else {
+		return nil
+	}
 }
 
 func (c *cursor) insert_after_prev(e *entry) bool {
@@ -582,7 +590,7 @@ func (t *table) createWaypoint(index uintH) *entry {
 			// someone else already put it in the list, so we use it
 			// and try to insert it into the table (we're helping!)
 
-			if c.find(e) {
+			if c.find(e) != nil {
 				e = c.match
 				break
 			}
@@ -689,37 +697,41 @@ func (t *table) insertWaypoint(e *entry) bool {
 func (t *table) lookup(e *entry) *entry {
 	c := t.waypointFor(e)
 
-	if c.find(e) {
+	if c.find(e) != nil {
 		return c.match
 	}
 
 	return nil
 }
 
-func (t *table) store(e *entry, shouldGrow *bool) (old *entry) {
+func (t *table) store(e *entry, shouldGrow *bool, cond conditionFunc) (old *entry, inserted bool) {
 	c := t.waypointFor(e)
 
 	found := c.find(e)
 
-	if !found {
+	if cond != nil && !cond(found, e) {
+		return found, false
+	}
+
+	if found == nil {
 		if !c.insert_after_prev(e) {
-			return t.storeSlow(e, shouldGrow)
+			return t.storeSlow(e, shouldGrow, cond)
 		}
 		*shouldGrow = c.count > t.growInsertCount
-		return nil
+		return nil, true
 	} else {
 		if !c.insert_after_match(e) {
-			return t.storeSlow(e, shouldGrow)
+			return t.storeSlow(e, shouldGrow, cond)
 		}
 		if !c.replace_after_prev(c.match, e) {
 			c.repair_from_start()
 		}
-		return c.match
+		return c.match, true
 	}
 
 }
 
-func (t *table) storeSlow(e *entry, shouldGrow *bool)  (old *entry) {
+func (t *table) storeSlow(e *entry, shouldGrow *bool, cond conditionFunc) (old *entry, inserted bool) {
 
 	var c cursor
 
@@ -728,14 +740,18 @@ func (t *table) storeSlow(e *entry, shouldGrow *bool)  (old *entry) {
 
 		found := c.findSlow(e)
 
-		if !found { 
+		if cond != nil && !cond(found, e) {
+			return found, false
+		}
+
+		if found == nil {
 			if !c.insert_after_prev(e) {
 				t.pause()
 				continue
-			} 
+			}
 			*shouldGrow = c.count > t.growInsertCount
-			return nil
-		} 
+			return nil, true
+		}
 
 		// found an old version
 
@@ -749,7 +765,7 @@ func (t *table) storeSlow(e *entry, shouldGrow *bool)  (old *entry) {
 		}
 		break
 	}
-	return c.match
+	return c.match, true
 
 }
 
@@ -758,11 +774,11 @@ func (t *table) delete(e *entry, shouldShrink *bool) *entry {
 	for true {
 		c := t.waypointFor(e)
 
-		if !c.find(e) {
+		deleted = c.find(e)
+
+		if deleted == nil {
 			return nil
 		}
-
-		deleted = c.match
 
 		if !c.insert_after_match(e) {
 			t.pause()
@@ -971,7 +987,6 @@ type Map struct {
 	ShrinkEmptyCount int
 }
 
-
 func (m *Map) table() *table {
 	t := m.t.Load()
 	if t != nil {
@@ -1105,7 +1120,7 @@ func (m *Map) Store(key string, value any) {
 	}
 
 	var shouldGrow bool
-	t.store(e, &shouldGrow)
+	t.store(e, &shouldGrow, nil)
 
 	if shouldGrow {
 		m.resize(t.width, t.width+1)
