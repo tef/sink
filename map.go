@@ -2,7 +2,14 @@ package xsync
 
 // this package contains a lock-free concurrent map
 //
-// underneath, there's just a linked-list of (hash, key, value) entries,
+// yep, it's all lock free: lookups are lock-free, inserts are lock-free
+// deletes are lock free, and even shrink/grow are lock-free too
+//
+// it's basically a lookup table and a linked list inside a trench coat.
+//
+// first, the linked list:
+//
+// we start with a singly linked-list of (hash, key, value) entries,
 // with start and end sentinels. for example, a list with
 // two values looks like this, and we keep it in (hash, key) order:
 //
@@ -10,43 +17,50 @@ package xsync
 //     start, a1, b1, end
 // ```
 //
-// to insert new versions, we add them to the list, and for deletes
-// we insert a tombstone. all new items come after the old ones:
+// to insert new entry, we insert it after any old versions, and
+// similarly for deletes, we also insert a tombstone after any previous
+// versions. for example, if we insert a new a2, we delete b1, and insert
+// a new key c1, and two new versions, the list could look like this:
 //
 // ```
 //     start, a1, a2, b1, bX, c1, c2, c3, end
 // ```
 //
-// once we've inserted the new versions, we can trim out the old
-// versions from the list:
+// after we insert the new entries, we trim out the old versions
+// from the list. for example, we would always end up with this
+// list, after compaction.
 //
 // ```
 //     start, a2, c3, end
 // ```
 //
-// this means that lookups must search for the last matching item
-// in the list, rather than the first.
+// yes, this means that lookups must search for the last matching item
+// in the list, rather than the first, which does involve a little
+// more work, but there is a good reason for it.
 //
-// it might seem a little weird, but we have good reasons for it.
+// by adding new entries after the old, we can safely delete the earlier
+// entries without any danger.
 //
-// with a concurrent linked list, it's easy to add new items lock-free
-// but deleting items from a list can be much harder:
+// danger? let me explain the problem:
+//
+// with a concurrent linked list it's easy to add new items lock-free
+// but deleting items from a list can be much harder. another thread
+// can append to the parts you're trying to delete
 //
 // ```
-//     start, a1, aX, end
-//     start, a1, aX, b1, end // must not happen
-//     start, end // what must happen before inserts
+//     start, a1, aX, end        // we have a value and a tombstone
+//     start, a1, aX, b1, end    // and if we insert a value after it
+//     start, end 		 // another thread can accidentally delete it
+//				 // as it never saw insert
 // ```
 //
-// when we delete items from the list, we copy over aX's next pointer
-// into start, and if another thread tries to insert after aX, it
-// might happen after aX has been removed from the list.
+// to stop this happening, we do not allow inserting entries after a tombstone
+// and force threads to compact the list, if they want to insert there
 //
-// to prevent this, we do not allow entries to be inserted after tombstones
-// and require all new versions to be added after old ones, effectively
-// freezing those next pointers from changes.
+// this is also why we add new versions after the old version, as that's
+// where a tombstone must go to prevent changes
 //
-// more formally:
+// more formally, the argument for lock-freedom works something like this:
 //
 // - it's always safe to read an item once it's in the list,
 //   as only the next pointer can change
@@ -58,57 +72,55 @@ package xsync
 // - as old versions and tombstones have frozen next pointers, we can
 //   patch them out of the list, without worrying about other threads
 //
-// alongside the linked-list, we keep a lookup table of special entries
-// throughout the list:
+// that's pretty much it for the linked list
+//
+// next up: the lookup table
+//
+// in order to speed up searching through the list, we store a bunch of waypoint
+// entries in amongst the regular key:value entries, and keep the waypoints
+// inside a lookup table.
+//
+// for example, we can have a lookup table with two waypoints, 0, and 1. if a
+// hash has a leading bit of 1, we use the 1 waypoint for searches, etc:
 //
 // ```
-//     start --> 0 --> 0xxx... ---> 1 -->  1xxx... ---> end
+//     start --> waypoint 0 --> 0xxx... ---> waypoint 1 -->  1xxx... ---> end
 // ```
 //
-// when we search the list, we take the prefix of the hash we're looking
-// for, and use the lookup table to jump further into the list.
-//
-// when the list gets too big, we create new dummy entries inside the list
-// and create a new, larger lookup table, reusing the older entries:
+// when the list gets too big, we create new waypoint entries inside the list
+// and create a new, larger waypoint table, reusing the older entries as we go:
 //
 // ```
 // start -> 00         -> 01         -> 10         -> 11         -> end
 // start -> 000 -> 001 -> 010 -> 011 -> 100 -> 101 -> 110 -> 111 -> end
 // ```
+// growing and shrinking are done in the background, which means that waypoints
+// can be inserted and deleted by other threads, and so the code has to handle
+// compacting the list to remove old waypoints, or inserting a waypoint only to
+// find that the table has been resized.
 //
-// we grow the table when it takes more than some N entries to find
-// an item. when we delete an entry, we check to see if there's any
-// items before, or after the now removed element, and if we find
-// two dummy items afterwards, we shrink the table in half.
+// it's a little gnarly, but it's manageable. we could avoid this by waiting
+// on old threads to exit before clearing out old waypoints, but this would
+// mean resizing can be blocked by other threads.
 //
-// i.e if we delete X from `00 --> X -- > 01 --> 10...`  we
-// can infer that the `00-->01` and `01 --> 10` stretches are empty
-// and shrink the jump table.
+// as for triggering resizes, instead of keeping accurate list sizes, we
+// use two simple heruistics to gently nudge the map in the right direction.
 //
-// growing and shrinking a jump table can be done concurrently
-// as readers can use earlier items in the table if the desired
-// entry is missing,
+// - if we search more than N entries to insert a new item into the list
+//   we tell the map to double the waypoint table
 //
-// this does mean handling some weird cases
+// - if we delete an item, and it's the last item between waypoints, we
+//   check to see how many empty sections come after the item, and if
+//   it is above some threshold, we tell the map to halve the table
 //
-// - a dummy entry is inserted, but must be deleted as the table is being evicted
-// - the table has been shrunk then grown, and so another thread sees the dummy
-//   and inserts it into the table
-// - the older thread gasps and goes "uh oh" and drops the item
-// - the newer thread now has a tombstone'd waypoint in the array
+// ... and that's pretty much everything, except for one final detail.
+// this structure is very similar to, and directly inspired by the
+// split-ordered list, another concurrent map described in:
 //
-// if we used epochs, and waited for old readers before shrinking/growing
-// we'd avoid this problem altogether, but it's not really that annoying
-// to clear out and reinsert items upon errors
-//
-//
-// nb: this strucure is very similar to, and directly inspired by:
-// "Split-Ordered Lists: Lock-Free Extensible Hash Tables"
+//       "Split-Ordered Lists: Lock-Free Extensible Hash Tables"
 //
 // the paper also uses a lock-free linked list and a jump table
-// to speed up searches
-//
-// the key differences are:
+// to speed up searches. the key differences are:
 //
 // the paper uses pointer tagging to freeze out next pointers, whereas
 // we use a tombstone. they can stop at the first match, but we have to
@@ -122,12 +134,17 @@ package xsync
 // order, they reverse the bits and so effectively sort it by trailing
 // zero count, so '1', '10', '100', all map to the same slot.
 //
+// this means that resizing a table only involves appending to the jump table
+// which is kinda nice, but not nice enough to do the same here.
+//
 // as we replace the jump table each time it grows, we don't need
 // to worry about preserving the offsets into the table during resizes,
-// and keeping things in lexicographic order means that we can
-// handle missing jump entries with very little fuss.
+//
+// keeping things in lexicographic order means that we can
+// handle missing waypoint entries in the jump table with very little fuss.
 //
 // we also use different logic to manage splitting and growing.
+// but that's a given, frankly.
 //
 // in some ways, this is a simplification (no pointer tagging, no bithacks)
 // but in others, it's a complication (read until last match, tombstones)
@@ -138,32 +155,49 @@ import (
 	"cmp"
 	"fmt"
 	"hash/maphash"
+	"math/bits" // don't get excited, we only use it for UintSize
 	"strings"
-	"sync/atomic"
+	"sync/atomic" // ... and we only use atomic.Pointer, too
 	"time"
 )
 
-const defaultInsertCount = 12 // length of search before suggesting grow
-const defaultEmptyCount = 6   // number of empty dummy sections found after delete before suggesting shrink
+type uintH uintptr
 
-const uint64w = 64
-const hashBits = 56 // width of uint64 - flag nibble
+const uintHbits = bits.UintSize
+const maxHashBits = uintHbits - 4
 
-const hash_mask = 0xFFFF_FFFF_FFFF_FFF0
+const hash_mask = ^uintH(15)
 const entry_mask = 2
 const tombstone_mask = 3
+
+// as mentioned above, we use simple heuristics for growing/shrinking
+//
+// on inserting a new entry (rather than replacing an old version)
+// we count how many steps from the waypoint entry it took
+// and if it's above this threshold, we suggest doubling the table
+
+const defaultInsertCount = 12 // length of search before suggesting grow, on insert new
+
+// on deleting an item, we can see if there's no other item left in the section
+// between waypoints, and then we can see how many sections after it are empty too
+// and suggest a shrink
+
+// in theory, as hashes are uniform, two empty buckets means there's a lot of empty
+// space
+
+const defaultEmptyCount = 3 // empty waypoints before suggesting shrink, on delete
 
 // we store some flags inside of the `hash` field of `entry`:
 //
 // bit 0 is deleted, bit 1 is real/placeholder, bit 2 is sentinel
-// so 0000, dummy item
-//    0001, dummy tombstone
+// so 0000, waypoint item
+//    0001, waypoint tombstone
 //    0010, real item,
 //    0011, real tombstone
 //    1110, end sentinel value
 
 type entry struct {
-	hash  uint64
+	hash  uintH
 	key   string
 	value any
 	next  atomic.Pointer[entry]
@@ -173,7 +207,7 @@ func (e *entry) isDeleted() bool {
 	return e.hash&1 == 1
 }
 
-func (e *entry) isDummy() bool {
+func (e *entry) isWaypoint() bool {
 	return e.hash&2 == 0
 }
 
@@ -257,7 +291,7 @@ type cursor struct {
 }
 
 func (c *cursor) ready() bool {
-	// is there no tombstone following this dummy entry?
+	// is there no tombstone following this waypoint entry?
 
 	if c.start == nil || c.start.isDeleted() {
 		return false
@@ -287,6 +321,8 @@ func (c *cursor) find(needle *entry) bool {
 	next = c.next
 
 	count := 0
+	// XXX accurate counts ignoring tombstones
+
 	for next != nil {
 		c := next.compare(needle)
 
@@ -390,15 +426,15 @@ func (c *cursor) repair_from_start() bool {
 }
 
 func (c *cursor) count_empty_successors(n int) int {
-	// check the next entries for dummy entries
+	// check the next entries for waypoint entries
 	// which is used by delete to know when to shrink
 
 	count := 0
-	if !c.next.isDummy() {
+	if !c.next.isWaypoint() {
 		return 0
 	}
 	next := c.next.next.Load()
-	for next != nil && next.isDummy() && count < n {
+	for next != nil && next.isWaypoint() && count < n {
 		next = next.next.Load()
 		count += 1
 
@@ -430,24 +466,24 @@ func (t *table) pause() {
 	time.Sleep(time.Duration(d) * time.Millisecond)
 }
 
-func (t *table) hash(key string) uint64 {
-	hash := maphash.String(t.seed, key)
+func (t *table) hash(key string) uintH {
+	hash := uintH(maphash.String(t.seed, key))
 	return (hash & hash_mask) | entry_mask
 }
 
-func (t *table) tombstone_hash(key string) uint64 {
-	hash := maphash.String(t.seed, key)
+func (t *table) tombstone_hash(key string) uintH {
+	hash := uintH(maphash.String(t.seed, key))
 	return (hash & hash_mask) | tombstone_mask
 }
 
 func (t *table) cursorFor(e *entry) cursor {
-	index := e.hash >> (uint64w - t.width)
+	index := e.hash >> (uintHbits - t.width)
 	var c cursor
 
 	for true {
 		start := t.entries[index].Load()
 		if start == nil {
-			start = t.insertDummy(index)
+			start = t.insertWaypoint(index)
 		}
 
 		if start != nil && start != t.expunged {
@@ -462,8 +498,8 @@ func (t *table) cursorFor(e *entry) cursor {
 			}
 		}
 
-		// we found a dummy, but there's a tombstone next to it(?!)
-		// or when we tried to insert, a previous dummy had a tombstone
+		// we found a waypoint, but there's a tombstone next to it(?!)
+		// or when we tried to insert, a previous waypoint had a tombstone
 
 		// we could be being expunged, so we forward the lookup:
 
@@ -473,25 +509,25 @@ func (t *table) cursorFor(e *entry) cursor {
 		}
 
 		// alas, if we're the most recent table, someone has decided to
-		// evict the dummy entry, so we must clear the entry
+		// evict the waypoint entry, so we must clear the entry
 
 		if start != nil && start != t.expunged {
 			t.entries[index].CompareAndSwap(start, nil)
 		}
 
-		// and insertDummy will compact it and try again
+		// and insertWaypoint will compact it and try again
 		t.pause()
 	}
 
 	return c
 }
 
-func (t *table) insertDummy(index uint64) *entry {
+func (t *table) insertWaypoint(index uintH) *entry {
 	if index == 0 {
 		return t.start
 	}
 
-	hash := index << (uint64w - t.width)
+	hash := index << (uintHbits - t.width)
 
 	e := &entry{
 		hash: hash,
@@ -510,7 +546,7 @@ func (t *table) insertDummy(index uint64) *entry {
 			return old
 		}
 
-		start = t.insertDummy(index - 1)
+		start = t.insertWaypoint(index - 1)
 		if start == t.expunged || start == nil {
 			return start
 		}
@@ -527,7 +563,7 @@ func (t *table) insertDummy(index uint64) *entry {
 			}
 
 			if c.match != nil && c.match.isDeleted() {
-				// we found a dummy tombstone, so compact
+				// we found a waypoint tombstone, so compact
 				// and retry
 				c.repair_from_start()
 			} else if c.insert_after_prev(e) {
@@ -571,7 +607,7 @@ func (t *table) insertDummy(index uint64) *entry {
 	// or find a home for it in the new table
 
 	nt := t.new.Load()
-	if nt.repairDummyInsert(inserted) {
+	if nt.repairWaypointInsert(inserted) {
 		// it's valid, so we just make progress
 		return e
 	}
@@ -596,14 +632,14 @@ func (t *table) insertDummy(index uint64) *entry {
 	return t.expunged
 }
 
-func (t *table) repairDummyInsert(e *entry) bool {
+func (t *table) repairWaypointInsert(e *entry) bool {
 	nt := t.new.Load()
 	if nt != nil {
-		return nt.repairDummyInsert(e)
+		return nt.repairWaypointInsert(e)
 	}
 
-	index := e.hash >> (uint64w - t.width)
-	hash := index << (uint64w - t.width)
+	index := e.hash >> (uintHbits - t.width)
+	hash := index << (uintHbits - t.width)
 
 	if e.hash != hash {
 		return false
@@ -696,7 +732,7 @@ func (t *table) delete(e *entry) (*entry, bool) {
 			c.repair_from_start()
 		}
 
-		if c.prev.isDummy() {
+		if c.prev.isWaypoint() {
 			// check to see if we're the last item
 			count = c.count_empty_successors(t.shrinkEmptyCount-1) + 1
 		}
@@ -708,7 +744,7 @@ func (t *table) delete(e *entry) (*entry, bool) {
 }
 
 func (t *table) resize(from int, to int) *table {
-	if to < 0 || to > hashBits {
+	if to < 0 || to > maxHashBits {
 		return nil
 	}
 	if to == t.width || from != t.width {
@@ -824,7 +860,7 @@ func (t *table) sweepOld() {
 			continue
 		}
 
-		// ... and clear out old dummy entries
+		// ... and clear out old waypoint entries
 
 		e := &entry{
 			hash: o.hash | 1,
@@ -873,7 +909,7 @@ func (t *table) print() string {
 
 	for next != nil {
 		var v string
-		if next.isDummy() {
+		if next.isWaypoint() {
 			v = ""
 		} else if next.isDeleted() {
 			v = fmt.Sprintf("-%v\n", next.key)
@@ -900,25 +936,23 @@ func (m *Map) table() *table {
 		return t
 	}
 
-	start := &entry{
-		hash: 0,
+	expunged := &entry{
+		hash: ^uintH(0),
 	}
 	end := &entry{
-		hash: ^uint64(0) - 1,
+		hash: ^uintH(0) - 1,
+	}
+	start := &entry{
+		hash: uintH(0),
 	}
 
 	start.next.Store(end)
 
-	entries := make([]atomic.Pointer[entry], 1)
-
-	entries[0].Store(start)
-
-	expunged := &entry{
-		hash: ^uint64(0),
-	}
-
 	grow := cmp.Or(m.GrowInsertCount, defaultInsertCount)
 	shrink := cmp.Or(m.ShrinkEmptyCount, defaultEmptyCount)
+
+	entries := make([]atomic.Pointer[entry], 1)
+	entries[0].Store(start)
 
 	t = &table{
 		seed:             maphash.MakeSeed(),
@@ -992,16 +1026,6 @@ func (m *Map) tryResize(from int, to int) {
 	}
 }
 
-func (m *Map) fill() {
-	t := m.table()
-
-	for i := range t.entries {
-		if t.entries[i].Load() == nil {
-			t.insertDummy(uint64(i))
-		}
-	}
-}
-
 func (m *Map) Clear() {
 	m.t.Store(nil)
 }
@@ -1051,6 +1075,27 @@ func (m *Map) Delete(key string) {
 	_, shouldShrink := t.delete(e)
 	if shouldShrink {
 		m.resize(t.width, t.width-1)
+	}
+}
+
+/*
+   CompareAndSwap(key, old, new any) (swapped bool)
+   Swap(key, value any) (previous any, loaded bool)
+
+   CompareAndDelete(key, old any) (deleted bool)
+   LoadAndDelete(key any) (value any, loaded bool)
+   LoadOrStore(key, value any) (actual any, loaded bool)
+
+   Range(f func(key, value any) bool)
+*/
+
+func (m *Map) fill() {
+	t := m.table()
+
+	for i := range t.entries {
+		if t.entries[i].Load() == nil {
+			t.insertWaypoint(uintH(i))
+		}
 	}
 }
 
