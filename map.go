@@ -358,8 +358,6 @@ func (c *cursor[K, V]) walk(needle *entry[K, V]) *entry[K, V] {
 	count := 0
 	last := next
 
-	// XXX accurate counts ignoring tombstones
-
 	for next != nil {
 		if last.compare(next) != 0 && !last.isDeleted() && !last.isWaypoint() {
 			count += 1
