@@ -212,11 +212,14 @@ func TestMapResize(t *testing.T) {
 	m.waitStable()
 
 	tb := m.table()
-	t.Log("table now at version", tb.version)
-	t.Log("resize 4 from", tb.width)
+	t.Log("table now at version", tb.version, "width", tb.width)
 
+	t.Log("resize(", tb.width, ",", 4, ")")
 	m.resize(tb.width, 4)
 	m.waitVersion(tb.version + 1)
+
+	tb = m.table()
+	t.Log("table now at version", tb.version, "width", tb.width)
 
 	tb = m.table()
 	t.Log("after grow 4 from", tb.width, ", now at version", tb.version)
@@ -251,9 +254,12 @@ func TestMapResize(t *testing.T) {
 }
 
 func TestRun(t *testing.T) {
-	n := 1_000_000
+	n := 1_000_000 * 2
 
-	m := &Map[string, int]{}
+	m := &Map[string, int]{
+		GrowInsertCount:  8,
+		ShrinkEmptyCount: 4,
+	}
 	m.Store("key", 123)
 
 	ex := Executor{fake: false}

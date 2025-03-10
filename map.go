@@ -669,7 +669,7 @@ func (t *table[K, V]) createWaypoint(index uintH) *entry[K, V] {
 	// or find a home for it in the new table
 
 	nt := t.new.Load()
-	if nt.insertWaypoint(inserted) {
+	if nt != nil && nt.insertWaypoint(inserted) {
 		// it's valid, so we just make progress
 		return e
 	}
@@ -869,12 +869,15 @@ func (t *table[K, V]) resize(from int, to int) *table[K, V] {
 
 		gap := nt.width - t.width
 
+		// we tank performance if we drop in a mostly empty table
+		// as everything rushes to fill out the entries
+
 		if gap > 0 {
 			for i := range t.entries {
 				j := i << gap
 				old := t.entries[i].Load()
 				if old != nil {
-					nt.entries[j].Store(old)
+					nt.entries[j].CompareAndSwap(nil, old)
 				}
 			}
 		} else if gap < 0 {
@@ -882,7 +885,7 @@ func (t *table[K, V]) resize(from int, to int) *table[K, V] {
 				j := i << -gap
 				old := t.entries[j].Load()
 				if old != nil {
-					nt.entries[i].Store(old)
+					nt.entries[i].CompareAndSwap(nil, old)
 				}
 			}
 		}
@@ -890,7 +893,9 @@ func (t *table[K, V]) resize(from int, to int) *table[K, V] {
 		if !t.new.CompareAndSwap(nil, nt) {
 			nt = t.new.Load()
 		}
+
 	}
+
 	return nt
 }
 
@@ -912,7 +917,12 @@ func (t *table[K, V]) deleteOldWaypoints() {
 		// we mark out every old entry, even ones we copied over
 		// to stop new entries being added to the old table
 
-		o := old.entries[i].Swap(sentinel)
+		o := old.entries[i].Load()
+		if o == t.expunged {
+			continue
+		}
+
+		o = old.entries[i].Swap(sentinel)
 
 		if o == nil || o.isDeleted() {
 			continue
@@ -1079,14 +1089,8 @@ func (m *Map[K, V]) resize(from int, to int) {
 
 	old := t.old.Load()
 	if old != nil {
-		// we could help t.deleteOldWaypoints()
-		return // already shrinking
-	}
-
-	new := t.new.Load()
-	if new != nil {
-		// we don't sweep old table until
-		// t has been replaced, so nothing to do
+		// already grown, so help expunge
+		go t.deleteOldWaypoints()
 		return
 	}
 
@@ -1098,16 +1102,16 @@ func (m *Map[K, V]) tryResize(from int, to int) {
 
 	old := t.old.Load()
 	if old != nil {
-		// could help t.deleteOldWaypoints()
+		// clear out old before resizing
+		go t.deleteOldWaypoints()
 		return
 	}
 
-	new := t.new.Load()
-	if new != nil {
-		return // already growing
-	}
+	nt := t.new.Load()
 
-	nt := t.resize(from, to)
+	if nt == nil {
+		nt = t.resize(from, to)
+	}
 
 	if nt == nil || nt == t {
 		return
@@ -1119,14 +1123,14 @@ func (m *Map[K, V]) tryResize(from int, to int) {
 
 	for true {
 		if m.t.CompareAndSwap(t, nt) {
-			// fmt.Printf("new table is v%d\n", nt.version)
-			nt.deleteOldWaypoints()
+			//fmt.Printf("new table is v%d\n", nt.version)
 			break
 		}
 		if m.t.Load() == nt {
 			break
 		}
 	}
+	nt.deleteOldWaypoints()
 }
 
 func (m *Map[K, V]) Clear() {
@@ -1348,6 +1352,7 @@ func (m *Map[K, V]) fill() {
 func (m *Map[K, V]) waitStable() uint {
 	for true {
 		t := m.t.Load()
+		t.pause()
 		if t == nil {
 			break
 		}
