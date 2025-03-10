@@ -866,7 +866,7 @@ func (t *table) deleteOldWaypoints() {
 
 		}
 
-		// we're shrinking, and so we try and compact the tail
+		// otherwise, we're shrinking, and so we try and compact the tail
 
 		if compact != nil {
 			c2 := o.cursor()
@@ -879,8 +879,7 @@ func (t *table) deleteOldWaypoints() {
 			}
 		}
 
-		// if we're shrinking, then we copy
-		// over the matching items
+		// some table items are copied over
 
 		j := (i >> gap)
 		if i == (j << gap) {
@@ -888,7 +887,7 @@ func (t *table) deleteOldWaypoints() {
 			continue
 		}
 
-		// ... and clear out old waypoint entries
+		// and the rest get cleared out
 
 		e := &entry{
 			hash: o.hash | 1,
@@ -926,6 +925,7 @@ func (t *table) deleteOldWaypoints() {
 	// fmt.Printf("done sweeping v%d's old (v%d), clearing old\n", t.version, old.version)
 
 }
+
 func (t *table) print() string {
 
 	var b strings.Builder
@@ -968,7 +968,7 @@ func (m *Map) table() *table {
 		hash: ^uintH(0),
 	}
 	end := &entry{
-		hash: ^uintH(0) - 1,
+		hash: ^uintH(0) - 3,
 	}
 	start := &entry{
 		hash: uintH(0),
@@ -1045,12 +1045,20 @@ func (m *Map) tryResize(from int, to int) {
 	if nt == nil || nt == t {
 		return
 	}
+
 	if nt.version != t.version+1 {
-		panic("what???")
+		panic("bad: tried to resize with a wrong version")
 	}
-	if m.t.CompareAndSwap(t, nt) {
-		// fmt.Printf("new table is v%d\n", nt.version)
-		nt.deleteOldWaypoints()
+
+	for true {
+		if m.t.CompareAndSwap(t, nt) {
+			// fmt.Printf("new table is v%d\n", nt.version)
+			nt.deleteOldWaypoints()
+			break
+		}
+		if m.t.Load() == nt {
+			break
+		}
 	}
 }
 
@@ -1105,6 +1113,32 @@ func (m *Map) Delete(key string) {
 		m.resize(t.width, t.width-1)
 	}
 }
+func (m *Map) Range(f func(key string, value any) bool) {
+	t := m.table()
+
+	start := t.start
+	next := start.next.Load()
+
+	last := next
+
+	for next != nil {
+		if last.compare(next) != 0 {
+			if !last.isDeleted() && !last.isWaypoint() {
+				if !f(last.key, last.value) {
+					break
+				}
+
+			}
+
+		}
+		last = next
+		next = next.next.Load()
+	}
+
+	if last != t.end {
+		panic("what")
+	}
+}
 
 /*
    CompareAndSwap(key, old, new any) (swapped bool)
@@ -1114,7 +1148,6 @@ func (m *Map) Delete(key string) {
    LoadAndDelete(key any) (value any, loaded bool)
    LoadOrStore(key, value any) (actual any, loaded bool)
 
-   Range(f func(key, value any) bool)
 */
 
 func (m *Map) fill() {

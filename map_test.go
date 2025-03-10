@@ -71,6 +71,31 @@ func TestMapPrint(t *testing.T) {
 	t.Log(m.print())
 }
 
+func TestMapRange(t *testing.T) {
+	m := &Map{}
+
+	for i := 0; i < 16; i++ {
+		key := fmt.Sprint(i)
+		m.Store(key, i*i)
+		_, ok := m.Load(key)
+		if !ok {
+			t.Fatal("missing", key)
+		}
+	}
+
+	count := 0
+
+	m.Range(func(key string, value any) bool {
+		count += 1
+		t.Log("saw", key, value)
+		return true
+	})
+
+	if count != 16 {
+		t.Fatal("missing keys")
+	}
+}
+
 func TestMapResize(t *testing.T) {
 	m := &Map{}
 
