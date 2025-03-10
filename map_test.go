@@ -36,15 +36,15 @@ func (e *Executor) Go(f func()) {
 
 func TestMapLoadStore(t *testing.T) {
 	var ok bool
-	var v any
+	var v int
 
-	m := &Map{}
+	m := &Map[string, int]{}
 
 	m.Store("key", 123)
 	v, ok = m.Load("key")
 	if !ok {
 		t.Fatal("missing")
-	} else if v.(int) != 123 {
+	} else if v != 123 {
 		t.Fatal("wrong", v)
 	} else {
 		t.Logf("lookup: %v", v)
@@ -53,15 +53,15 @@ func TestMapLoadStore(t *testing.T) {
 
 func TestMapDelete(t *testing.T) {
 	var ok bool
-	var v any
+	var v int
 
-	m := &Map{}
+	m := &Map[string, int]{}
 
 	m.Store("key", 123)
 	v, ok = m.Load("key")
 	if !ok {
 		t.Fatal("missing")
-	} else if v.(int) != 123 {
+	} else if v != 123 {
 		t.Fatal("wrong", v)
 	} else {
 		t.Logf("lookup: %v", v)
@@ -79,16 +79,16 @@ func TestMapDelete(t *testing.T) {
 
 func TestMapLoadStoreDelete(t *testing.T) {
 	var ok bool
-	var v any
+	var v int
 
-	m := &Map{}
+	m := &Map[string, int]{}
 
 	m.Store("key", 456)
 
 	v, ok = m.LoadOrStore("key", 789)
 	if !ok {
 		t.Fatal("missing")
-	} else if v.(int) != 456 {
+	} else if v != 456 {
 		t.Fatal("wrong", v)
 	} else {
 		t.Logf("load or store: %v", v)
@@ -97,7 +97,7 @@ func TestMapLoadStoreDelete(t *testing.T) {
 	v, ok = m.LoadAndDelete("key")
 	if !ok {
 		t.Fatal("missing")
-	} else if v.(int) != 456 {
+	} else if v != 456 {
 		t.Fatal("wrong", v)
 	} else {
 		t.Logf("load and delete: %v", v)
@@ -121,16 +121,16 @@ func TestMapLoadStoreDelete(t *testing.T) {
 
 func TestMapCompareSwap(t *testing.T) {
 	var ok bool
-	var v any
+	var v int
 
-	m := &Map{}
+	m := &Map[string, int]{}
 
 	m.Store("key", 789)
 
 	v, ok = m.Swap("key", 101112)
 	if !ok {
 		t.Fatal("missing")
-	} else if v.(int) != 789 {
+	} else if v != 789 {
 		t.Fatal("wrong", v)
 	} else {
 		t.Logf("load and delete: %v", v)
@@ -167,12 +167,12 @@ func TestMapCompareSwap(t *testing.T) {
 }
 
 func TestMapPrint(t *testing.T) {
-	m := &Map{}
+	m := &Map[string, int]{}
 	t.Log(m.print())
 }
 
 func TestMapRange(t *testing.T) {
-	m := &Map{}
+	m := &Map[string, int]{}
 
 	for i := 0; i < 16; i++ {
 		key := fmt.Sprint(i)
@@ -185,7 +185,7 @@ func TestMapRange(t *testing.T) {
 
 	count := 0
 
-	m.Range(func(key string, value any) bool {
+	m.Range(func(key string, value int) bool {
 		count += 1
 		t.Log("saw", key, value)
 		return true
@@ -197,7 +197,7 @@ func TestMapRange(t *testing.T) {
 }
 
 func TestMapResize(t *testing.T) {
-	m := &Map{}
+	m := &Map[string, int]{}
 
 	for i := 0; i < 16; i++ {
 		key := fmt.Sprint(i)
@@ -258,7 +258,7 @@ func TestMapResize(t *testing.T) {
 func TestRun(t *testing.T) {
 	n := 1_000_000
 
-	m := &Map{}
+	m := &Map[string, int]{}
 	m.Store("key", 123)
 
 	ex := Executor{fake: false}
@@ -273,7 +273,7 @@ func TestRun(t *testing.T) {
 			val := i
 			m.Store(key, val)
 			v, ok := m.Load(key)
-			if !ok || v.(int) != val {
+			if !ok || v != val {
 				t.Fatal("missing", key, ok, v, "expected", val)
 			}
 		})
@@ -294,7 +294,7 @@ func TestRun(t *testing.T) {
 			val := i - 1
 			m.Store(key, val)
 			v, ok := m.Load(key)
-			if !ok || v.(int) != val {
+			if !ok || v != val {
 				t.Fatal("missing", key, ok, v, "expected", val)
 			}
 		})

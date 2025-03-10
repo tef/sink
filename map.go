@@ -196,28 +196,31 @@ const hash_mask = ^uintH(15)
 const entry_mask = 2
 const tombstone_mask = 3
 
-type conditionFunc func(old *entry, new *entry) bool
+type Key cmp.Ordered
+type Value comparable
 
-type entry struct {
+type conditionFunc[K Key, V Value] func(old *entry[K, V], new *entry[K, V]) bool
+
+type entry[K Key, V Value] struct {
 	hash  uintH
-	key   string
-	value any
-	next  atomic.Pointer[entry]
+	key   K
+	value V
+	next  atomic.Pointer[entry[K, V]]
 }
 
-func (e *entry) cursor() cursor {
-	return cursor{start: e, prev: e}
+func (e *entry[K, V]) cursor() cursor[K, V] {
+	return cursor[K, V]{start: e, prev: e}
 }
 
-func (e *entry) isDeleted() bool {
+func (e *entry[K, V]) isDeleted() bool {
 	return e.hash&1 == 1
 }
 
-func (e *entry) isWaypoint() bool {
+func (e *entry[K, V]) isWaypoint() bool {
 	return e.hash&2 == 0
 }
 
-func (e *entry) compare(o *entry) int {
+func (e *entry[K, V]) compare(o *entry[K, V]) int {
 	return cmp.Or(
 		// deleted items compare the same
 		cmp.Compare(e.hash>>1, o.hash>>1),
@@ -225,16 +228,16 @@ func (e *entry) compare(o *entry) int {
 	)
 }
 
-func (e *entry) insert_after(old *entry, value *entry) bool {
+func (e *entry[K, V]) insert_after(old *entry[K, V], value *entry[K, V]) bool {
 	value.next.Store(old)
 	return e.next.CompareAndSwap(old, value)
 }
 
-func (e *entry) replace_next(old *entry, value *entry) bool {
+func (e *entry[K, V]) replace_next(old *entry[K, V], value *entry[K, V]) bool {
 	return e.next.CompareAndSwap(old, value)
 }
 
-func (e *entry) compact(next *entry) (*entry, *entry) {
+func (e *entry[K, V]) compact(next *entry[K, V]) (*entry[K, V], *entry[K, V]) {
 	// we search for  e ---> (start ---> .... ---> end) --> next
 	// where start ... end are all entries for the same value
 
@@ -290,17 +293,17 @@ func (e *entry) compact(next *entry) (*entry, *entry) {
 // start --> entries* ---> prev --> next
 //
 
-type cursor struct {
-	start *entry
+type cursor[K Key, V Value] struct {
+	start *entry[K, V]
 
-	prev  *entry
-	match *entry
-	next  *entry
+	prev  *entry[K, V]
+	match *entry[K, V]
+	next  *entry[K, V]
 
 	count int
 }
 
-func (c *cursor) ready() bool {
+func (c *cursor[K, V]) ready() bool {
 	// is there no tombstone following this waypoint entry?
 
 	if c.start == nil || c.start.isDeleted() {
@@ -323,9 +326,9 @@ func (c *cursor) ready() bool {
 	return true
 }
 
-func (c *cursor) walk(needle *entry) *entry {
+func (c *cursor[K, V]) walk(needle *entry[K, V]) *entry[K, V] {
 	// always called on a ready entry
-	var prev_match, match, next *entry
+	var prev_match, match, next *entry[K, V]
 
 	prev_match = c.prev
 	next = c.next
@@ -367,9 +370,9 @@ func (c *cursor) walk(needle *entry) *entry {
 	}
 }
 
-func (c *cursor) walkSlow(needle *entry) *entry {
+func (c *cursor[K, V]) walkSlow(needle *entry[K, V]) *entry[K, V] {
 	// always called on a ready entry
-	var prev_match, match, prev_next, next, after *entry
+	var prev_match, match, prev_next, next, after *entry[K, V]
 
 	prev_next = c.prev
 	prev_match = c.prev
@@ -412,7 +415,7 @@ func (c *cursor) walkSlow(needle *entry) *entry {
 	}
 }
 
-func (c *cursor) insert_after_prev(e *entry) bool {
+func (c *cursor[K, V]) insert_after_prev(e *entry[K, V]) bool {
 	// called after ready()
 	if !c.prev.isDeleted() && c.prev.insert_after(c.next, e) {
 		return true
@@ -420,7 +423,7 @@ func (c *cursor) insert_after_prev(e *entry) bool {
 	return false
 }
 
-func (c *cursor) insert_after_match(e *entry) bool {
+func (c *cursor[K, V]) insert_after_match(e *entry[K, V]) bool {
 	if !c.match.isDeleted() && c.match.insert_after(c.next, e) {
 		// we do not update c.match as we use it
 		// later
@@ -429,14 +432,14 @@ func (c *cursor) insert_after_match(e *entry) bool {
 	return false
 }
 
-func (c *cursor) replace_after_prev(old *entry, e *entry) bool {
+func (c *cursor[K, V]) replace_after_prev(old *entry[K, V], e *entry[K, V]) bool {
 	if !c.prev.isDeleted() && c.prev.replace_next(old, e) {
 		return true
 	}
 	return false
 }
 
-func (c *cursor) repair_from_start() bool {
+func (c *cursor[K, V]) repair_from_start() bool {
 	// compact every entry from start to next
 
 	slow := c.start.cursor()
@@ -449,7 +452,7 @@ func (c *cursor) repair_from_start() bool {
 	return true
 }
 
-func (c *cursor) count_empty_successors(n int) int {
+func (c *cursor[K, V]) count_empty_successors(n int) int {
 	// check the next entries for waypoint entries
 	// which is used by delete to know when to shrink
 
@@ -484,43 +487,43 @@ func (c *cursor) count_empty_successors(n int) int {
 // cleared, so that old readers can sneak ahead
 // to the latest lookup table
 
-type table struct {
+type table[K Key, V Value] struct {
 	version uint
 
 	seed  maphash.Seed
-	start *entry
-	end   *entry
+	start *entry[K, V]
+	end   *entry[K, V]
 
 	width   int
-	entries []atomic.Pointer[entry]
+	entries []atomic.Pointer[entry[K, V]]
 
-	new atomic.Pointer[table]
-	old atomic.Pointer[table]
+	new atomic.Pointer[table[K, V]]
+	old atomic.Pointer[table[K, V]]
 
-	expunged *entry
+	expunged *entry[K, V]
 
 	growInsertCount  int
 	shrinkEmptyCount int
 }
 
-func (t *table) pause() {
+func (t *table[K, V]) pause() {
 	d := 128 - t.width - (t.width >> 1)
 	time.Sleep(time.Duration(d) * time.Millisecond)
 }
 
-func (t *table) hash(key string) uintH {
-	hash := uintH(maphash.String(t.seed, key))
+func (t *table[K, V]) hash(key K) uintH {
+	hash := uintH(maphash.Comparable(t.seed, key))
 	return (hash & hash_mask) | entry_mask
 }
 
-func (t *table) tombstone_hash(key string) uintH {
-	hash := uintH(maphash.String(t.seed, key))
+func (t *table[K, V]) tombstone_hash(key K) uintH {
+	hash := uintH(maphash.Comparable(t.seed, key))
 	return (hash & hash_mask) | tombstone_mask
 }
 
-func (t *table) waypointFor(e *entry) cursor {
+func (t *table[K, V]) waypointFor(e *entry[K, V]) cursor[K, V] {
 	index := e.hash >> (uintHbits - t.width)
-	var c cursor
+	var c cursor[K, V]
 
 	for true {
 		start := t.entries[index].Load()
@@ -561,21 +564,21 @@ func (t *table) waypointFor(e *entry) cursor {
 	return c
 }
 
-func (t *table) createWaypoint(index uintH) *entry {
+func (t *table[K, V]) createWaypoint(index uintH) *entry[K, V] {
 	if index == 0 {
 		return t.start
 	}
 
 	hash := index << (uintHbits - t.width)
 
-	e := &entry{
+	e := &entry[K, V]{
 		hash: hash,
 	}
 
-	var c cursor
-	var old *entry
-	var start *entry
-	var inserted *entry
+	var c cursor[K, V]
+	var old *entry[K, V]
+	var start *entry[K, V]
+	var inserted *entry[K, V]
 
 	for true {
 		// check before inserting that it's still empty
@@ -651,7 +654,7 @@ func (t *table) createWaypoint(index uintH) *entry {
 		return e
 	}
 
-	tombstone := &entry{hash: inserted.hash | 1}
+	tombstone := &entry[K, V]{hash: inserted.hash | 1}
 	for true {
 		c2 := inserted.cursor()
 		if !c2.ready() {
@@ -671,7 +674,7 @@ func (t *table) createWaypoint(index uintH) *entry {
 	return t.expunged
 }
 
-func (t *table) insertWaypoint(e *entry) bool {
+func (t *table[K, V]) insertWaypoint(e *entry[K, V]) bool {
 	// used when we created a waypoint
 	// but our lookup table was expunged
 
@@ -700,7 +703,7 @@ func (t *table) insertWaypoint(e *entry) bool {
 	return start == e
 }
 
-func (t *table) lookup(e *entry) *entry {
+func (t *table[K, V]) lookup(e *entry[K, V]) *entry[K, V] {
 	c := t.waypointFor(e)
 
 	if c.walk(e) != nil {
@@ -710,7 +713,7 @@ func (t *table) lookup(e *entry) *entry {
 	return nil
 }
 
-func (t *table) store(e *entry, shouldGrow *bool, cond conditionFunc) (old *entry, inserted bool) {
+func (t *table[K, V]) store(e *entry[K, V], shouldGrow *bool, cond conditionFunc[K, V]) (old *entry[K, V], inserted bool) {
 	c := t.waypointFor(e)
 
 	found := c.walk(e)
@@ -737,9 +740,9 @@ func (t *table) store(e *entry, shouldGrow *bool, cond conditionFunc) (old *entr
 
 }
 
-func (t *table) storeSlow(e *entry, shouldGrow *bool, cond conditionFunc) (old *entry, inserted bool) {
+func (t *table[K, V]) storeSlow(e *entry[K, V], shouldGrow *bool, cond conditionFunc[K, V]) (old *entry[K, V], inserted bool) {
 
-	var c cursor
+	var c cursor[K, V]
 
 	for true {
 		c = t.waypointFor(e)
@@ -775,8 +778,8 @@ func (t *table) storeSlow(e *entry, shouldGrow *bool, cond conditionFunc) (old *
 
 }
 
-func (t *table) delete(e *entry, shouldShrink *bool, cond conditionFunc) (*entry, bool) {
-	var deleted *entry
+func (t *table[K, V]) delete(e *entry[K, V], shouldShrink *bool, cond conditionFunc[K, V]) (*entry[K, V], bool) {
+	var deleted *entry[K, V]
 	for true {
 		c := t.waypointFor(e)
 
@@ -810,7 +813,7 @@ func (t *table) delete(e *entry, shouldShrink *bool, cond conditionFunc) (*entry
 	return deleted, true
 }
 
-func (t *table) resize(from int, to int) *table {
+func (t *table[K, V]) resize(from int, to int) *table[K, V] {
 	if to < 0 || to > maxHashBits {
 		return nil
 	}
@@ -827,10 +830,10 @@ func (t *table) resize(from int, to int) *table {
 	nt := t.new.Load()
 	if nt == nil {
 		new_len := 1 << to
-		new_table := make([]atomic.Pointer[entry], new_len)
+		new_table := make([]atomic.Pointer[entry[K, V]], new_len)
 		new_table[0].Store(t.start)
 
-		nt = &table{
+		nt = &table[K, V]{
 			version:          t.version + 1,
 			start:            t.start,
 			end:              t.end,
@@ -871,7 +874,7 @@ func (t *table) resize(from int, to int) *table {
 	return nt
 }
 
-func (t *table) deleteOldWaypoints() {
+func (t *table[K, V]) deleteOldWaypoints() {
 	old := t.old.Load()
 	if old == nil {
 		return
@@ -883,7 +886,7 @@ func (t *table) deleteOldWaypoints() {
 
 	// fmt.Printf("sweeping v%d's old (v%d), from %d to %d\n", t.version, old.version, old.width, t.width)
 
-	var compact *entry
+	var compact *entry[K, V]
 
 	for i := len(old.entries) - 1; i >= 0; i-- {
 		// we mark out every old entry, even ones we copied over
@@ -928,7 +931,7 @@ func (t *table) deleteOldWaypoints() {
 
 		// and the rest get cleared out
 
-		e := &entry{
+		e := &entry[K, V]{
 			hash: o.hash | 1,
 		}
 		for true {
@@ -965,7 +968,7 @@ func (t *table) deleteOldWaypoints() {
 
 }
 
-func (t *table) print() string {
+func (t *table[K, V]) print() string {
 
 	var b strings.Builder
 
@@ -990,26 +993,26 @@ func (t *table) print() string {
 	return b.String()
 }
 
-type Map struct {
-	t atomic.Pointer[table]
+type Map[K Key, V Value] struct {
+	t atomic.Pointer[table[K, V]]
 
 	GrowInsertCount  int
 	ShrinkEmptyCount int
 }
 
-func (m *Map) table() *table {
+func (m *Map[K, V]) table() *table[K, V] {
 	t := m.t.Load()
 	if t != nil {
 		return t
 	}
 
-	expunged := &entry{
+	expunged := &entry[K, V]{
 		hash: ^uintH(0),
 	}
-	end := &entry{
+	end := &entry[K, V]{
 		hash: ^uintH(0) - 3,
 	}
-	start := &entry{
+	start := &entry[K, V]{
 		hash: uintH(0),
 	}
 
@@ -1018,10 +1021,10 @@ func (m *Map) table() *table {
 	grow := cmp.Or(m.GrowInsertCount, defaultInsertCount)
 	shrink := cmp.Or(m.ShrinkEmptyCount, defaultEmptyCount)
 
-	entries := make([]atomic.Pointer[entry], 1)
+	entries := make([]atomic.Pointer[entry[K, V]], 1)
 	entries[0].Store(start)
 
-	t = &table{
+	t = &table[K, V]{
 		seed:             maphash.MakeSeed(),
 		start:            start,
 		end:              end,
@@ -1039,12 +1042,12 @@ func (m *Map) table() *table {
 	}
 }
 
-func (m *Map) print() string {
+func (m *Map[K, V]) print() string {
 	t := m.table()
 	return t.print()
 }
 
-func (m *Map) resize(from int, to int) {
+func (m *Map[K, V]) resize(from int, to int) {
 	t := m.t.Load()
 	if t == nil {
 		return
@@ -1065,7 +1068,7 @@ func (m *Map) resize(from int, to int) {
 	go m.tryResize(from, to)
 }
 
-func (m *Map) tryResize(from int, to int) {
+func (m *Map[K, V]) tryResize(from int, to int) {
 	t := m.t.Load()
 
 	old := t.old.Load()
@@ -1101,13 +1104,13 @@ func (m *Map) tryResize(from int, to int) {
 	}
 }
 
-func (m *Map) Clear() {
+func (m *Map[K, V]) Clear() {
 	m.t.Store(nil)
 }
 
-func (m *Map) Load(key string) (value any, ok bool) {
+func (m *Map[K, V]) Load(key K) (value V, ok bool) {
 	t := m.table()
-	e := entry{
+	e := entry[K, V]{
 		hash: t.hash(key),
 		key:  key,
 	}
@@ -1117,33 +1120,32 @@ func (m *Map) Load(key string) (value any, ok bool) {
 	if match != nil {
 		return match.value, true
 	}
-	return nil, false
+	var empty V
+	return empty, false
 }
 
-var noCondition conditionFunc = nil
-
-func (m *Map) Store(key string, value any) {
+func (m *Map[K, V]) Store(key K, value V) {
 	t := m.table()
 
-	e := &entry{
+	e := &entry[K, V]{
 		hash:  t.hash(key),
 		key:   key,
 		value: value,
 	}
 
 	var shouldGrow bool
-	t.store(e, &shouldGrow, noCondition)
+	t.store(e, &shouldGrow, nil)
 
 	if shouldGrow {
 		m.resize(t.width, t.width+1)
 	}
 }
 
-func (m *Map) Swap(key string, value any) (previous any, loaded bool) {
+func (m *Map[K, V]) Swap(key K, value V) (previous V, loaded bool) {
 	// aka Store and return old value, if any
 	t := m.table()
 
-	e := &entry{
+	e := &entry[K, V]{
 		hash:  t.hash(key),
 		key:   key,
 		value: value,
@@ -1151,27 +1153,28 @@ func (m *Map) Swap(key string, value any) (previous any, loaded bool) {
 
 	var shouldGrow bool
 
-	old, _ := t.store(e, &shouldGrow, noCondition)
+	old, _ := t.store(e, &shouldGrow, nil)
 
 	if shouldGrow {
 		m.resize(t.width, t.width+1)
 	}
 
 	if old == nil {
-		return nil, false
+		var empty V
+		return empty, false
 	} else {
 		return old.value, true
 	}
 }
 
-func loadOrStore(old *entry, new *entry) bool {
+func loadOrStore[K Key, V Value](old *entry[K, V], new *entry[K, V]) bool {
 	return old == nil
 }
 
-func (m *Map) LoadOrStore(key string, value any) (actual any, loaded bool) {
+func (m *Map[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
 	t := m.table()
 
-	e := &entry{
+	e := &entry[K, V]{
 		hash:  t.hash(key),
 		key:   key,
 		value: value,
@@ -1192,10 +1195,10 @@ func (m *Map) LoadOrStore(key string, value any) (actual any, loaded bool) {
 	}
 }
 
-func (m *Map) CompareAndSwap(key string, oldValue any, value any) (swapped bool) {
+func (m *Map[K, V]) CompareAndSwap(key K, oldValue V, value V) (swapped bool) {
 	t := m.table()
 
-	e := &entry{
+	e := &entry[K, V]{
 		hash:  t.hash(key),
 		key:   key,
 		value: value,
@@ -1203,7 +1206,7 @@ func (m *Map) CompareAndSwap(key string, oldValue any, value any) (swapped bool)
 
 	var shouldGrow bool
 
-	compareAndSwap := func(old *entry, new *entry) bool {
+	compareAndSwap := func(old *entry[K, V], new *entry[K, V]) bool {
 		return old != nil && old.value == oldValue
 	}
 
@@ -1215,17 +1218,17 @@ func (m *Map) CompareAndSwap(key string, oldValue any, value any) (swapped bool)
 	return inserted
 }
 
-func (m *Map) CompareAndDelete(key string, oldValue any) (deleted bool) {
+func (m *Map[K, V]) CompareAndDelete(key K, oldValue V) (deleted bool) {
 	t := m.table()
 
-	e := &entry{
+	e := &entry[K, V]{
 		hash:  t.hash(key),
 		key:   key,
 		value: oldValue,
 	}
 
 	var shouldShrink bool
-	compareAndDelete := func(old *entry, new *entry) bool {
+	compareAndDelete := func(old *entry[K, V], new *entry[K, V]) bool {
 		return old != nil && old.value == oldValue
 	}
 
@@ -1238,35 +1241,35 @@ func (m *Map) CompareAndDelete(key string, oldValue any) (deleted bool) {
 	return deleted
 }
 
-func (m *Map) Delete(key string) {
+func (m *Map[K, V]) Delete(key K) {
 	t := m.table()
 	hash := t.tombstone_hash(key)
 
-	e := &entry{
+	e := &entry[K, V]{
 		hash: hash,
 		key:  key,
 	}
 
 	var shouldShrink bool
 
-	t.delete(e, &shouldShrink, noCondition)
+	t.delete(e, &shouldShrink, nil)
 	if shouldShrink {
 		m.resize(t.width, t.width-1)
 	}
 }
 
-func (m *Map) LoadAndDelete(key string) (value any, loaded bool) {
+func (m *Map[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
 	t := m.table()
 	hash := t.tombstone_hash(key)
 
-	e := &entry{
+	e := &entry[K, V]{
 		hash: hash,
 		key:  key,
 	}
 
 	var shouldShrink bool
 
-	old, _ := t.delete(e, &shouldShrink, noCondition)
+	old, _ := t.delete(e, &shouldShrink, nil)
 
 	if shouldShrink {
 		m.resize(t.width, t.width-1)
@@ -1274,10 +1277,11 @@ func (m *Map) LoadAndDelete(key string) (value any, loaded bool) {
 	if old != nil {
 		return old.value, true
 	}
-	return nil, false
+	var empty V
+	return empty, false
 }
 
-func (m *Map) Range(f func(key string, value any) bool) {
+func (m *Map[K, V]) Range(f func(key K, value V) bool) {
 	t := m.table()
 
 	start := t.start
@@ -1306,7 +1310,7 @@ func (m *Map) Range(f func(key string, value any) bool) {
 
 // --- test helpers
 
-func (m *Map) fill() {
+func (m *Map[K, V]) fill() {
 	t := m.table()
 
 	for i := range t.entries {
@@ -1316,7 +1320,7 @@ func (m *Map) fill() {
 	}
 }
 
-func (m *Map) waitResize() {
+func (m *Map[K, V]) waitResize() {
 	for true {
 		t := m.t.Load()
 		t.pause()
@@ -1333,7 +1337,7 @@ func (m *Map) waitResize() {
 	}
 }
 
-func (m *Map) waitGrow(w int) {
+func (m *Map[K, V]) waitGrow(w int) {
 	for true {
 		t := m.t.Load()
 		t.pause()
@@ -1352,7 +1356,7 @@ func (m *Map) waitGrow(w int) {
 	}
 }
 
-func (m *Map) waitShrink(w int) {
+func (m *Map[K, V]) waitShrink(w int) {
 	for true {
 		t := m.t.Load()
 		t.pause()
