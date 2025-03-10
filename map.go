@@ -168,7 +168,7 @@ import (
 // we count how many steps from the waypoint entry it took
 // and if it's above this threshold, we suggest doubling the table
 
-const defaultInsertCount = 12 // length of search before suggesting grow, on insert new
+const defaultInsertCount = 6 // length of search before suggesting grow, on insert new
 
 // on deleting an item, we can see if there's no other item left in the section
 // between waypoints, and then we can see how many sections after it are empty too
@@ -177,7 +177,7 @@ const defaultInsertCount = 12 // length of search before suggesting grow, on ins
 // in theory, as hashes are uniform, two empty buckets means there's a lot of empty
 // space
 
-const defaultEmptyCount = 3 // empty waypoints before suggesting shrink, on delete
+const defaultEmptyCount = 2 // empty waypoints before suggesting shrink, on delete
 
 // we use a uintptr sized hash, and we use the lowest four bits for flags
 //
@@ -276,8 +276,8 @@ func (e *entry) compact(next *entry) (*entry, *entry) {
 // we create one from a waypoint entry, with e.cursor()
 //
 // we then call cursor.ready(), to check that we have
-// a valid waypoint, and then call .find or findSlow
-// to search for a given entry
+// a valid waypoint, and then call .walk or walkSlow
+// to walk to a position in the list
 //
 // when a match is found, we set c.match, and we store
 // the predecessor node of the earliest matching entry
@@ -323,7 +323,7 @@ func (c *cursor) ready() bool {
 	return true
 }
 
-func (c *cursor) find(needle *entry) *entry {
+func (c *cursor) walk(needle *entry) *entry {
 	// always called on a ready entry
 	var prev_match, match, next *entry
 
@@ -331,9 +331,15 @@ func (c *cursor) find(needle *entry) *entry {
 	next = c.next
 
 	count := 0
+	last := next
+
 	// XXX accurate counts ignoring tombstones
 
 	for next != nil {
+		if last.compare(next) != 0 && !last.isDeleted() && !last.isWaypoint() {
+			count += 1
+		}
+
 		c := next.compare(needle)
 
 		if c < 0 {
@@ -346,8 +352,8 @@ func (c *cursor) find(needle *entry) *entry {
 			break
 		}
 
+		last = next
 		next = next.next.Load()
-		count += 1
 	}
 	c.prev = prev_match
 	c.match = match
@@ -361,7 +367,7 @@ func (c *cursor) find(needle *entry) *entry {
 	}
 }
 
-func (c *cursor) findSlow(needle *entry) *entry {
+func (c *cursor) walkSlow(needle *entry) *entry {
 	// always called on a ready entry
 	var prev_match, match, prev_next, next, after *entry
 
@@ -439,7 +445,7 @@ func (c *cursor) repair_from_start() bool {
 		return false
 	}
 
-	slow.findSlow(c.next)
+	slow.walkSlow(c.next)
 	return true
 }
 
@@ -590,7 +596,7 @@ func (t *table) createWaypoint(index uintH) *entry {
 			// someone else already put it in the list, so we use it
 			// and try to insert it into the table (we're helping!)
 
-			if c.find(e) != nil {
+			if c.walk(e) != nil {
 				e = c.match
 				break
 			}
@@ -697,7 +703,7 @@ func (t *table) insertWaypoint(e *entry) bool {
 func (t *table) lookup(e *entry) *entry {
 	c := t.waypointFor(e)
 
-	if c.find(e) != nil {
+	if c.walk(e) != nil {
 		return c.match
 	}
 
@@ -707,7 +713,7 @@ func (t *table) lookup(e *entry) *entry {
 func (t *table) store(e *entry, shouldGrow *bool, cond conditionFunc) (old *entry, inserted bool) {
 	c := t.waypointFor(e)
 
-	found := c.find(e)
+	found := c.walk(e)
 
 	if cond != nil && !cond(found, e) {
 		return found, false
@@ -738,7 +744,7 @@ func (t *table) storeSlow(e *entry, shouldGrow *bool, cond conditionFunc) (old *
 	for true {
 		c = t.waypointFor(e)
 
-		found := c.findSlow(e)
+		found := c.walkSlow(e)
 
 		if cond != nil && !cond(found, e) {
 			return found, false
@@ -774,7 +780,7 @@ func (t *table) delete(e *entry, shouldShrink *bool, cond conditionFunc) (*entry
 	for true {
 		c := t.waypointFor(e)
 
-		deleted = c.find(e)
+		deleted = c.walk(e)
 
 		if deleted == nil {
 			return nil, false
@@ -904,7 +910,7 @@ func (t *table) deleteOldWaypoints() {
 		if compact != nil {
 			c2 := o.cursor()
 			if c2.ready() {
-				c2.findSlow(compact) // compact up to this target
+				c2.walkSlow(compact) // compact up to this target
 				// if we found it, then it wasn't deleted
 				if c2.match == nil {
 					compact = nil
@@ -944,7 +950,7 @@ func (t *table) deleteOldWaypoints() {
 	if compact != nil {
 		c := t.start.cursor()
 		if c.ready() {
-			c.findSlow(compact)
+			c.walkSlow(compact)
 		}
 	}
 

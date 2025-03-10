@@ -34,11 +34,29 @@ func (e *Executor) Go(f func()) {
 	}()
 }
 
-func TestMapBasic(t *testing.T) {
+func TestMapLoadStore(t *testing.T) {
 	var ok bool
 	var v any
 
 	m := &Map{}
+
+	m.Store("key", 123)
+	v, ok = m.Load("key")
+	if !ok {
+		t.Fatal("missing")
+	} else if v.(int) != 123 {
+		t.Fatal("wrong", v)
+	} else {
+		t.Logf("lookup: %v", v)
+	}
+}
+
+func TestMapDelete(t *testing.T) {
+	var ok bool
+	var v any
+
+	m := &Map{}
+
 	m.Store("key", 123)
 	v, ok = m.Load("key")
 	if !ok {
@@ -49,17 +67,23 @@ func TestMapBasic(t *testing.T) {
 		t.Logf("lookup: %v", v)
 	}
 
-	t.Log("store")
-	m.Store("key", 456)
+	m.Delete("key")
 
 	v, ok = m.Load("key")
-	if !ok {
-		t.Fatal("missing")
-	} else if v.(int) != 456 {
-		t.Fatal("wrong", v)
+	if ok {
+		t.Fatal("deleted key has value", v)
 	} else {
-		t.Logf("lookup: %v", v)
+		t.Logf("deleted")
 	}
+}
+
+func TestMapLoadStoreDelete(t *testing.T) {
+	var ok bool
+	var v any
+
+	m := &Map{}
+
+	m.Store("key", 456)
 
 	v, ok = m.LoadOrStore("key", 789)
 	if !ok {
@@ -93,6 +117,16 @@ func TestMapBasic(t *testing.T) {
 		t.Logf("load or store: %v", v)
 	}
 
+}
+
+func TestMapCompareSwap(t *testing.T) {
+	var ok bool
+	var v any
+
+	m := &Map{}
+
+	m.Store("key", 789)
+
 	v, ok = m.Swap("key", 101112)
 	if !ok {
 		t.Fatal("missing")
@@ -102,23 +136,16 @@ func TestMapBasic(t *testing.T) {
 		t.Logf("load and delete: %v", v)
 	}
 
-	v, ok = m.LoadAndDelete("key")
+	ok = m.CompareAndDelete("key", 101112)
 	if !ok {
-		t.Fatal("missing")
-	} else if v.(int) != 101112 {
-		t.Fatal("wrong", v)
+		t.Fatal("failed to delete")
 	} else {
-		t.Logf("load and delete: %v", v)
-	}
-
-	v, ok = m.LoadAndDelete("key")
-	if ok {
-		t.Fatal("not deleted", v)
+		t.Logf("compare and delete")
 	}
 
 	v, ok = m.Swap("key", 131415)
 	if ok {
-		t.Fatal("missing")
+		t.Fatal("empty key has value")
 	} else {
 		t.Logf("swap %v", v)
 	}
@@ -129,6 +156,7 @@ func TestMapBasic(t *testing.T) {
 	} else {
 		t.Logf("compare and swap")
 	}
+
 	ok = m.CompareAndDelete("key", 161718)
 	if !ok {
 		t.Fatal("missing")
@@ -227,8 +255,8 @@ func TestMapResize(t *testing.T) {
 
 }
 
-func TestMapRun(t *testing.T) {
-	n := 65535 << 7
+func TestRun(t *testing.T) {
+	n := 1_000_000
 
 	m := &Map{}
 	m.Store("key", 123)
