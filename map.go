@@ -84,16 +84,17 @@ package xsync
 // hash has a leading bit of 1, we use the 1 waypoint for searches, etc:
 //
 // ```
-//     start --> waypoint 0 --> 0xxx... ---> waypoint 1 -->  1xxx... ---> end
+//     start (waypoint 0) --> 0xxx... ---> waypoint 1 -->  1xxx... ---> end
 // ```
 //
 // when the list gets too big, we create new waypoint entries inside the list
 // and create a new, larger waypoint table, reusing the older entries as we go:
 //
 // ```
-// start -> 00         -> 01         -> 10         -> 11         -> end
-// start -> 000 -> 001 -> 010 -> 011 -> 100 -> 101 -> 110 -> 111 -> end
+// start (00)         -> 01         -> 10         -> 11         -> end
+// start (000) -> 001 -> 010 -> 011 -> 100 -> 101 -> 110 -> 111 -> end
 // ```
+//
 // growing and shrinking are done in the background, which means that waypoints
 // can be inserted and deleted by other threads, and so the code has to handle
 // compacting the list to remove old waypoints, or inserting a waypoint only to
@@ -161,15 +162,6 @@ import (
 	"time"
 )
 
-type uintH uintptr
-
-const uintHbits = bits.UintSize
-const maxHashBits = uintHbits - 4
-
-const hash_mask = ^uintH(15)
-const entry_mask = 2
-const tombstone_mask = 3
-
 // as mentioned above, we use simple heuristics for growing/shrinking
 //
 // on inserting a new entry (rather than replacing an old version)
@@ -187,14 +179,22 @@ const defaultInsertCount = 12 // length of search before suggesting grow, on ins
 
 const defaultEmptyCount = 3 // empty waypoints before suggesting shrink, on delete
 
-// we store some flags inside of the `hash` field of `entry`:
+// we use a uintptr sized hash, and we use the lowest four bits for flags
 //
-// bit 0 is deleted, bit 1 is real/placeholder, bit 2 is sentinel
-// so 0000, waypoint item
+//    0000, waypoint entry (and start value)
 //    0001, waypoint tombstone
-//    0010, real item,
-//    0011, real tombstone
+//    0010, key/value entry,
+//    0011, key/value tombstone
 //    1110, end sentinel value
+
+type uintH uintptr
+
+const uintHbits = bits.UintSize
+const maxHashBits = uintHbits - 4
+
+const hash_mask = ^uintH(15)
+const entry_mask = 2
+const tombstone_mask = 3
 
 type entry struct {
 	hash  uintH
@@ -203,16 +203,16 @@ type entry struct {
 	next  atomic.Pointer[entry]
 }
 
+func (e *entry) cursor() cursor {
+	return cursor{start: e, prev: e}
+}
+
 func (e *entry) isDeleted() bool {
 	return e.hash&1 == 1
 }
 
 func (e *entry) isWaypoint() bool {
 	return e.hash&2 == 0
-}
-
-func (e *entry) cursor() cursor {
-	return cursor{start: e, prev: e}
 }
 
 func (e *entry) compare(o *entry) int {
@@ -233,6 +233,9 @@ func (e *entry) replace_next(old *entry, value *entry) bool {
 }
 
 func (e *entry) compact(next *entry) (*entry, *entry) {
+	// we search for  e ---> (start ---> .... ---> end) --> next
+	// where start ... end are all entries for the same value
+
 	if next == nil {
 		next = e.next.Load()
 	}
@@ -244,9 +247,6 @@ func (e *entry) compact(next *entry) (*entry, *entry) {
 	start := next
 	end := start
 	next = end.next.Load()
-
-	// we search for  e ---> (start ---> .... ---> end) --> next
-	// where start ... end are all entries for the same value
 
 	for next != nil && start.compare(next) == 0 {
 		end = next
@@ -269,16 +269,24 @@ func (e *entry) compact(next *entry) (*entry, *entry) {
 	return end, next
 }
 
-// a cursor represents an insertion point in the list
+// a cursor handles searching through the list for values
 //
-// it starts as (start, nil, nil, nil), then
-// walks to find a point in the list for a given entry
+// we create one from a waypoint entry, with e.cursor()
 //
-// ending up as (start, predecessor, matching node, successor)
-// or just      (start, predecessor, nil, successor)
+// we then call cursor.ready(), to check that we have
+// a valid waypoint, and then call .find or findSlow
+// to search for a given entry
 //
-// the cursor can then go on to insert after the matching node
-// or affter the predecessor
+// when a match is found, we set c.match, and we store
+// the predecessor node of the earliest matching entry
+//
+// start --> entries* ---> prev ---> old versions* --> last match --> next
+//
+// and if there's no match found, we stop at the point where
+// that entry could be inserted, between prev and next:
+//
+// start --> entries* ---> prev --> next
+//
 
 type cursor struct {
 	start *entry
@@ -442,6 +450,24 @@ func (c *cursor) count_empty_successors(n int) int {
 	return count
 }
 
+// a table contains the waypoint lookup table
+// and the start and end of the list, along
+// with other shared values, like the maphash Seed
+//
+// when we grow, we copy over these values from
+// one table to the next
+//
+// when we grow a table, we create a new table
+// and new_table.old points to the old table
+//
+// we install it by setting old_table.new to point to it
+// then updating the map
+//
+// new_table.old is cleared once the old table
+// has been expunged, but old_table.new is never
+// cleared, so that old readers can sneak ahead
+// to the latest lookup table
+
 type table struct {
 	version uint
 
@@ -476,21 +502,18 @@ func (t *table) tombstone_hash(key string) uintH {
 	return (hash & hash_mask) | tombstone_mask
 }
 
-func (t *table) cursorFor(e *entry) cursor {
+func (t *table) waypointFor(e *entry) cursor {
 	index := e.hash >> (uintHbits - t.width)
 	var c cursor
 
 	for true {
 		start := t.entries[index].Load()
+
 		if start == nil {
-			start = t.insertWaypoint(index)
+			start = t.createWaypoint(index)
 		}
 
 		if start != nil && start != t.expunged {
-			if start.compare(e) > 0 {
-				panic("bad")
-			}
-
 			c = start.cursor()
 
 			if c.ready() {
@@ -499,13 +522,13 @@ func (t *table) cursorFor(e *entry) cursor {
 		}
 
 		// we found a waypoint, but there's a tombstone next to it(?!)
-		// or when we tried to insert, a previous waypoint had a tombstone
+		// or maybe we bumped into a tombstone on a previous waypoint
 
 		// we could be being expunged, so we forward the lookup:
 
 		nt := t.new.Load()
 		if nt != nil {
-			return nt.cursorFor(e)
+			return nt.waypointFor(e)
 		}
 
 		// alas, if we're the most recent table, someone has decided to
@@ -515,14 +538,14 @@ func (t *table) cursorFor(e *entry) cursor {
 			t.entries[index].CompareAndSwap(start, nil)
 		}
 
-		// and insertWaypoint will compact it and try again
+		// and createWaypoint will compact it and try again
 		t.pause()
 	}
 
 	return c
 }
 
-func (t *table) insertWaypoint(index uintH) *entry {
+func (t *table) createWaypoint(index uintH) *entry {
 	if index == 0 {
 		return t.start
 	}
@@ -546,7 +569,7 @@ func (t *table) insertWaypoint(index uintH) *entry {
 			return old
 		}
 
-		start = t.insertWaypoint(index - 1)
+		start = t.createWaypoint(index - 1)
 		if start == t.expunged || start == nil {
 			return start
 		}
@@ -607,7 +630,7 @@ func (t *table) insertWaypoint(index uintH) *entry {
 	// or find a home for it in the new table
 
 	nt := t.new.Load()
-	if nt.repairWaypointInsert(inserted) {
+	if nt.insertWaypoint(inserted) {
 		// it's valid, so we just make progress
 		return e
 	}
@@ -632,10 +655,15 @@ func (t *table) insertWaypoint(index uintH) *entry {
 	return t.expunged
 }
 
-func (t *table) repairWaypointInsert(e *entry) bool {
+func (t *table) insertWaypoint(e *entry) bool {
+	// used when we created a waypoint
+	// but our lookup table was expunged
+
+	// and we forward the call if we've
+	// been replaced, too
 	nt := t.new.Load()
 	if nt != nil {
-		return nt.repairWaypointInsert(e)
+		return nt.insertWaypoint(e)
 	}
 
 	index := e.hash >> (uintHbits - t.width)
@@ -657,7 +685,7 @@ func (t *table) repairWaypointInsert(e *entry) bool {
 }
 
 func (t *table) lookup(e *entry) *entry {
-	c := t.cursorFor(e)
+	c := t.waypointFor(e)
 
 	if c.find(e) {
 		return c.match
@@ -667,7 +695,7 @@ func (t *table) lookup(e *entry) *entry {
 }
 
 func (t *table) store(e *entry) (*entry, bool) {
-	c := t.cursorFor(e)
+	c := t.waypointFor(e)
 
 	if !c.find(e) {
 		if !c.insert_after_prev(e) {
@@ -689,7 +717,7 @@ func (t *table) store(e *entry) (*entry, bool) {
 func (t *table) storeSlow(e *entry) (*entry, bool) {
 	var c cursor
 	for true {
-		c = t.cursorFor(e)
+		c = t.waypointFor(e)
 
 		if !c.findSlow(e) {
 			if !c.insert_after_prev(e) {
@@ -715,7 +743,7 @@ func (t *table) delete(e *entry) (*entry, bool) {
 	count := 0
 	var deleted *entry
 	for true {
-		c := t.cursorFor(e)
+		c := t.waypointFor(e)
 
 		if !c.find(e) {
 			return nil, false
@@ -804,7 +832,7 @@ func (t *table) resize(from int, to int) *table {
 	return nt
 }
 
-func (t *table) sweepOld() {
+func (t *table) deleteOldWaypoints() {
 	old := t.old.Load()
 	if old == nil {
 		return
@@ -985,7 +1013,7 @@ func (m *Map) resize(from int, to int) {
 
 	old := t.old.Load()
 	if old != nil {
-		// we could run t.sweepOld()
+		// we could run t.deleteOldWaypoints()
 		return // already shrinking
 	}
 
@@ -1022,7 +1050,7 @@ func (m *Map) tryResize(from int, to int) {
 	}
 	if m.t.CompareAndSwap(t, nt) {
 		// fmt.Printf("new table is v%d\n", nt.version)
-		nt.sweepOld()
+		nt.deleteOldWaypoints()
 	}
 }
 
@@ -1094,7 +1122,7 @@ func (m *Map) fill() {
 
 	for i := range t.entries {
 		if t.entries[i].Load() == nil {
-			t.insertWaypoint(uintH(i))
+			t.createWaypoint(uintH(i))
 		}
 	}
 }
