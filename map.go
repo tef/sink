@@ -143,8 +143,8 @@ import (
 	"time"
 )
 
-const maxInsertCount = 12 // length of search before suggesting grow
-const maxEmptyDummy = 6   // number of empty dummy sections found after delete before suggesting shrink
+const defaultInsertCount = 12 // length of search before suggesting grow
+const defaultEmptyCount = 6   // number of empty dummy sections found after delete before suggesting shrink
 
 const uint64w = 64
 const hashBits = 56 // width of uint64 - flag nibble
@@ -420,6 +420,9 @@ type table struct {
 	old atomic.Pointer[table]
 
 	expunged *entry
+
+	growInsertCount  int
+	shrinkEmptyCount int
 }
 
 func (t *table) pause() {
@@ -634,6 +637,7 @@ func (t *table) store(e *entry) (*entry, bool) {
 		if !c.insert_after_prev(e) {
 			return t.storeSlow(e)
 		}
+		return e, c.count > t.growInsertCount
 	} else {
 		if !c.insert_after_match(e) {
 			return t.storeSlow(e)
@@ -641,9 +645,9 @@ func (t *table) store(e *entry) (*entry, bool) {
 		if !c.replace_after_prev(c.match, e) {
 			c.repair_from_start()
 		}
+		return e, false
 	}
 
-	return e, c.count > maxInsertCount
 }
 
 func (t *table) storeSlow(e *entry) (*entry, bool) {
@@ -668,7 +672,7 @@ func (t *table) storeSlow(e *entry) (*entry, bool) {
 		break
 	}
 
-	return e, c.count > maxInsertCount
+	return e, c.count > t.growInsertCount
 }
 
 func (t *table) delete(e *entry) (*entry, bool) {
@@ -694,13 +698,13 @@ func (t *table) delete(e *entry) (*entry, bool) {
 
 		if c.prev.isDummy() {
 			// check to see if we're the last item
-			count = c.count_empty_successors(maxEmptyDummy-1) + 1
+			count = c.count_empty_successors(t.shrinkEmptyCount-1) + 1
 		}
 
 		break
 	}
 
-	return deleted, count >= maxEmptyDummy
+	return deleted, count >= t.shrinkEmptyCount
 }
 
 func (t *table) resize(from int, to int) *table {
@@ -724,13 +728,15 @@ func (t *table) resize(from int, to int) *table {
 		new_table[0].Store(t.start)
 
 		nt = &table{
-			version:  t.version + 1,
-			start:    t.start,
-			end:      t.end,
-			seed:     t.seed,
-			width:    to,
-			entries:  new_table,
-			expunged: t.expunged,
+			version:          t.version + 1,
+			start:            t.start,
+			end:              t.end,
+			seed:             t.seed,
+			width:            to,
+			entries:          new_table,
+			expunged:         t.expunged,
+			growInsertCount:  t.growInsertCount,
+			shrinkEmptyCount: t.shrinkEmptyCount,
 		}
 
 		nt.old.Store(t)
@@ -883,6 +889,9 @@ func (t *table) print() string {
 
 type Map struct {
 	t atomic.Pointer[table]
+
+	GrowInsertCount  int
+	ShrinkEmptyCount int
 }
 
 func (m *Map) table() *table {
@@ -908,13 +917,18 @@ func (m *Map) table() *table {
 		hash: ^uint64(0),
 	}
 
+	grow := cmp.Or(m.GrowInsertCount, defaultInsertCount)
+	shrink := cmp.Or(m.ShrinkEmptyCount, defaultEmptyCount)
+
 	t = &table{
-		seed:     maphash.MakeSeed(),
-		start:    start,
-		end:      end,
-		width:    0,
-		entries:  entries,
-		expunged: expunged,
+		seed:             maphash.MakeSeed(),
+		start:            start,
+		end:              end,
+		width:            0,
+		entries:          entries,
+		expunged:         expunged,
+		growInsertCount:  grow,
+		shrinkEmptyCount: shrink,
 	}
 
 	if m.t.CompareAndSwap(nil, t) {

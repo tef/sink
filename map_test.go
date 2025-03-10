@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sync"
 	"testing"
-	"time"
 )
 
 // t.Log(...)   / t.Logf("%v", v),     log message
@@ -35,20 +34,45 @@ func (e *Executor) Go(f func()) {
 	}()
 }
 
-func TestMapSimple(t *testing.T) {
+func TestMapBasic(t *testing.T) {
 	m := &Map{}
 	m.Store("key", 123)
 	v, ok := m.Load("key")
 	if !ok {
 		t.Fatal("missing")
+	} else if v.(int) != 123 {
+		t.Fatal("wrong", v)
 	} else {
 		t.Logf("lookup: %v", v)
 	}
+
+	m.Store("key", 456)
+	v, ok = m.Load("key")
+	if !ok {
+		t.Fatal("missing")
+	} else if v.(int) != 456 {
+		t.Fatal("wrong", v)
+	} else {
+		t.Logf("lookup: %v", v)
+	}
+
+	m.Delete("key")
+	v, ok = m.Load("key")
+	if ok {
+		t.Fatal("wrong", v)
+	} else {
+		t.Logf("deleted")
+	}
+
 }
 
-func TestMapGrow(t *testing.T) {
+func TestMapPrint(t *testing.T) {
 	m := &Map{}
-	m.Store("key", 123)
+	t.Log(m.print())
+}
+
+func TestMapResize(t *testing.T) {
+	m := &Map{}
 
 	for i := 0; i < 16; i++ {
 		key := fmt.Sprint(i)
@@ -61,41 +85,67 @@ func TestMapGrow(t *testing.T) {
 
 	t.Log("waiting on resize")
 	m.waitResize()
-	t.Log("done waiting on resize")
+
+	t.Log("waiting on resize: done")
 
 	tb := m.table()
 	t.Log("tryGrow 4 from", tb.width, "on version", tb.version)
 	m.tryResize(tb.width, 4)
+
 	tb = m.table()
 	t.Log("after tryGrow 4 from", tb.width, "on version", tb.version)
+
 	if tb.width < 4 {
 		t.Fatal("fail: tryGrow 4 from", tb.width, "on", tb.version)
 	}
+
+	// should exit
 	tb = m.table()
 	t.Log("waitGrow 4 from", tb.width, "on version", tb.version)
 	m.waitGrow(4)
 	t.Log("after waitGrow 4 from", tb.width, "on version", tb.version)
 	m.fill()
+	t.Log(m.print())
 
 	tb = m.table()
 	t.Log("shrink 2")
 	m.tryResize(tb.width, 2)
+
 	t.Log("shrink 2: wait")
 	m.waitShrink(2)
 	t.Log("shrink 2: fill")
 	m.fill()
+
 	t.Log(m.print())
 
-	t.Log("first wave")
+	m.waitResize()
+	tb = m.table()
+
+	t.Log("done, shrinking from", tb.width)
+
+	m.resize(tb.width, 0)
+	m.waitShrink(0)
+	t.Log(m.table().width)
+	t.Log(m.print())
+
+}
+
+func TestMapRun(t *testing.T) {
+	n := 65535 << 7
+
+	m := &Map{}
+	m.Store("key", 123)
 
 	ex := Executor{fake: false}
 
-	n := 65535 << 7
+	tb := m.table()
+	t.Log("at start, table is", tb.width, "wide, at version", tb.version)
+	t.Log("running", n, "inserts")
 
 	for i := 0; i < n; i++ {
 		ex.Go(func() {
 			key := fmt.Sprint(i)
-			val := i + 1
+			val := i
 			m.Store(key, val)
 			v, ok := m.Load(key)
 			if !ok || v.(int) != val {
@@ -104,14 +154,14 @@ func TestMapGrow(t *testing.T) {
 		})
 	}
 
-	t.Log("waiting on first wave")
+	t.Log("waiting on inserts")
 	ex.Wait()
 
-	t.Log(m.table().width)
-	t.Log("second wave")
+	tb = m.table()
+	t.Log("inserts done, table now ", tb.width, "wide, at version", tb.version)
+	t.Log("running", n, "updates")
 
 	ex = Executor{fake: false}
-	ex2 := Executor{fake: false}
 
 	for i := 0; i < n; i++ {
 		ex.Go(func() {
@@ -122,44 +172,58 @@ func TestMapGrow(t *testing.T) {
 			if !ok || v.(int) != val {
 				t.Fatal("missing", key, ok, v, "expected", val)
 			}
+		})
+	}
+	t.Log("waiting on updates")
+	ex.Wait()
+
+	tb = m.table()
+	t.Log("updates done, table now ", tb.width, "wide, at version", tb.version)
+	t.Log("running", n, "deletes")
+
+	ex = Executor{fake: false}
+
+	for i := 0; i < n; i++ {
+		ex.Go(func() {
+			key := fmt.Sprint(i)
 			m.Delete(key)
 		})
-		ex2.Go(func() {
-			time.Sleep(10 * time.Millisecond)
+	}
+	t.Log("waiting on deletes")
+	ex.Wait()
+
+	tb = m.table()
+	t.Log("deletes done, table now ", tb.width, "wide, at version", tb.version)
+	t.Log("running", n, "lookups")
+
+	ex = Executor{fake: false}
+
+	for i := 0; i < n; i++ {
+		ex.Go(func() {
 			key := fmt.Sprint(i)
-			ok := true
-			for ok {
-				time.Sleep(100 * time.Millisecond)
-				_, ok = m.Load(key)
+			val, ok := m.Load(key)
+			if ok {
+				t.Fatal("deleted key", key, "has value", val)
 			}
 		})
 	}
-	t.Log("waiting for deletes")
+	t.Log("waiting on lookups")
 	ex.Wait()
-	t.Log("deletes complete")
-	ex2.Wait()
 
-	v, ok := m.Load("key")
-	if !ok {
-		t.Fatal("missing")
-	} else {
-		t.Logf("lookup: %v", v)
-	}
+	tb = m.table()
+	t.Log("lookups done, table now ", tb.width, "wide, at version", tb.version)
+
+	t.Log("waiting for any resize to exit")
 	m.waitResize()
 	tb = m.table()
-	t.Log("done, shrinking from", tb.width)
+	t.Log("resizes over, table now ", tb.width, "wide, at version", tb.version)
+	t.Log("shrinking to 0")
 	m.resize(tb.width, 0)
 	m.waitShrink(0)
-	t.Log(m.table().width)
-	t.Log(m.print())
-
-}
-
-func TestMapDelete(t *testing.T) {
-	m := &Map{}
-	t.Log(m.print())
-	m.Store("key", 123)
-	t.Log(m.print())
-	m.Delete("key")
-	t.Log(m.print())
+	tb = m.table()
+	if tb.width > 0 {
+		t.Fatal("table should be 0 wide, is", tb.width)
+	}
+	tb = m.table()
+	t.Log("shrink done, table now ", tb.width, "wide, at version", tb.version)
 }
