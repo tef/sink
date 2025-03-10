@@ -1,9 +1,12 @@
 package xsync
 
-// this package contains a lock-free concurrent map
+// this package contains a lock-free, generic, concurrent map
+// which provides the same methods as the built in sync.Map
 //
-// yep, it's all lock free: lookups are lock-free, inserts are lock-free
-// deletes are lock free, and even shrink/grow are lock-free too
+// yep, it's all lock free: lookups, inserts, updates, deletes, as
+// well as scanning all entries, shrinking and growing the map
+//
+// neat, huh?
 //
 // it's basically a lookup table and a linked list inside a trench coat.
 //
@@ -74,6 +77,11 @@ package xsync
 //
 // that's pretty much it for the linked list
 //
+// that said: if the go stdlib had tagged pointers, we could have lock-free
+// deletes without tombstone values, but it doesn't, so we don't!
+//
+//
+//
 // next up: the lookup table
 //
 // in order to speed up searching through the list, we store a bunch of waypoint
@@ -104,6 +112,9 @@ package xsync
 // on old threads to exit before clearing out old waypoints, but this would
 // mean resizing can be blocked by other threads.
 //
+//
+// finally, resizes:
+//
 // as for triggering resizes, instead of keeping accurate list sizes, we
 // use two simple heruistics to gently nudge the map in the right direction.
 //
@@ -115,6 +126,10 @@ package xsync
 //   it is above some threshold, we tell the map to halve the table
 //
 // ... and that's pretty much everything, except for one final detail.
+//
+//
+// related work:
+//
 // this structure is very similar to, and directly inspired by the
 // split-ordered list, another concurrent map described in:
 //
@@ -151,6 +166,7 @@ package xsync
 // but in others, it's a complication (read until last match, tombstones)
 //
 // c'est la vie
+//
 
 import (
 	"cmp"
@@ -158,17 +174,28 @@ import (
 	"hash/maphash"
 	"math/bits" // don't get excited, we only use it for UintSize
 	"strings"
-	"sync/atomic" // ... and we only use atomic.Pointer, too
+	"sync/atomic" // and we only use atomic.Pointer
 	"time"
 )
 
+// type aliases
+
+type Key cmp.Ordered
+type Value comparable
+
+type conditionFunc[K Key, V Value] func(old *entry[K, V], new *entry[K, V]) bool
+
+// tuning params:
+
+const defaultInsertCount = 6 // length of search before suggesting grow, on insert new
+const defaultEmptyCount = 2  // empty waypoints before suggesting shrink, on delete
+
 // as mentioned above, we use simple heuristics for growing/shrinking
-//
+// the following defaults can be overriden per-map
+
 // on inserting a new entry (rather than replacing an old version)
 // we count how many steps from the waypoint entry it took
 // and if it's above this threshold, we suggest doubling the table
-
-const defaultInsertCount = 6 // length of search before suggesting grow, on insert new
 
 // on deleting an item, we can see if there's no other item left in the section
 // between waypoints, and then we can see how many sections after it are empty too
@@ -177,15 +204,7 @@ const defaultInsertCount = 6 // length of search before suggesting grow, on inse
 // in theory, as hashes are uniform, two empty buckets means there's a lot of empty
 // space
 
-const defaultEmptyCount = 2 // empty waypoints before suggesting shrink, on delete
-
-// we use a uintptr sized hash, and we use the lowest four bits for flags
-//
-//    0000, waypoint entry (and start value)
-//    0001, waypoint tombstone
-//    0010, key/value entry,
-//    0011, key/value tombstone
-//    1110, end sentinel value
+// the hash:
 
 type uintH uintptr
 
@@ -196,10 +215,13 @@ const hash_mask = ^uintH(15)
 const entry_mask = 2
 const tombstone_mask = 3
 
-type Key cmp.Ordered
-type Value comparable
-
-type conditionFunc[K Key, V Value] func(old *entry[K, V], new *entry[K, V]) bool
+// we use a uintptr sized hash, and we use the lowest four bits for flags
+//
+//    0000, waypoint entry (and start value)
+//    0001, waypoint tombstone
+//    0010, key/value entry,
+//    0011, key/value tombstone
+//    1110, end sentinel value
 
 type entry[K Key, V Value] struct {
 	hash  uintH
@@ -452,8 +474,8 @@ func (c *cursor[K, V]) repair_from_start() bool {
 	return true
 }
 
-func (c *cursor[K, V]) count_empty_successors(n int) int {
-	// check the next entries for waypoint entries
+func (c *cursor[K, V]) count_adjacent_waypoints(n int) int {
+	// check the next entries for adjacent waypoint entries
 	// which is used by delete to know when to shrink
 
 	count := 0
@@ -804,7 +826,7 @@ func (t *table[K, V]) delete(e *entry[K, V], shouldShrink *bool, cond conditionF
 
 		if c.prev.isWaypoint() {
 			// check to see if we're the last item
-			count := c.count_empty_successors(t.shrinkEmptyCount-1) + 1
+			count := c.count_adjacent_waypoints(t.shrinkEmptyCount-1) + 1
 			*shouldShrink = count >= t.shrinkEmptyCount
 		}
 
@@ -993,6 +1015,10 @@ func (t *table[K, V]) print() string {
 	return b.String()
 }
 
+// A Map is nothing more than a pointer to a table
+// and when we grow and shrink the table, we replace
+// the pointer inside the map
+
 type Map[K Key, V Value] struct {
 	t atomic.Pointer[table[K, V]]
 
@@ -1055,14 +1081,15 @@ func (m *Map[K, V]) resize(from int, to int) {
 
 	old := t.old.Load()
 	if old != nil {
-		// we could run t.deleteOldWaypoints()
+		// we could help t.deleteOldWaypoints()
 		return // already shrinking
 	}
 
 	new := t.new.Load()
 	if new != nil {
-		// we don't sweep old until it has been replaced
-		return // already growing
+		// we don't sweep old table until
+		// t has been replaced, so nothing to do
+		return
 	}
 
 	go m.tryResize(from, to)
@@ -1073,7 +1100,7 @@ func (m *Map[K, V]) tryResize(from int, to int) {
 
 	old := t.old.Load()
 	if old != nil {
-		// could run t.sweepddOld()
+		// could help t.deleteOldWaypoints()
 		return
 	}
 
@@ -1167,10 +1194,6 @@ func (m *Map[K, V]) Swap(key K, value V) (previous V, loaded bool) {
 	}
 }
 
-func loadOrStore[K Key, V Value](old *entry[K, V], new *entry[K, V]) bool {
-	return old == nil
-}
-
 func (m *Map[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
 	t := m.table()
 
@@ -1181,6 +1204,10 @@ func (m *Map[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
 	}
 
 	var shouldGrow bool
+
+	loadOrStore := func(old *entry[K, V], new *entry[K, V]) bool {
+		return old == nil
+	}
 
 	old, inserted := t.store(e, &shouldGrow, loadOrStore)
 
@@ -1228,6 +1255,7 @@ func (m *Map[K, V]) CompareAndDelete(key K, oldValue V) (deleted bool) {
 	}
 
 	var shouldShrink bool
+
 	compareAndDelete := func(old *entry[K, V], new *entry[K, V]) bool {
 		return old != nil && old.value == oldValue
 	}
