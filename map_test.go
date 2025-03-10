@@ -208,50 +208,45 @@ func TestMapResize(t *testing.T) {
 		}
 	}
 
-	t.Log("waiting on resize")
-	m.waitResize()
-
-	t.Log("waiting on resize: done")
+	t.Log("waiting on resizes in progress")
+	m.waitStable()
 
 	tb := m.table()
-	t.Log("tryGrow 4 from", tb.width, "on version", tb.version)
-	m.tryResize(tb.width, 4)
+	t.Log("table now at version", tb.version)
+	t.Log("resize 4 from", tb.width)
+
+	m.resize(tb.width, 4)
+	m.waitVersion(tb.version + 1)
 
 	tb = m.table()
-	t.Log("after tryGrow 4 from", tb.width, "on version", tb.version)
+	t.Log("after grow 4 from", tb.width, ", now at version", tb.version)
 
 	if tb.width < 4 {
-		t.Fatal("fail: tryGrow 4 from", tb.width, "on", tb.version)
+		t.Fatal("fail: grow 4 from", tb.width, "on", tb.version)
 	}
 
-	// should exit
-	tb = m.table()
-	t.Log("waitGrow 4 from", tb.width, "on version", tb.version)
-	m.waitGrow(4)
-	t.Log("after waitGrow 4 from", tb.width, "on version", tb.version)
+	t.Log("filling jump table")
 	m.fill()
 	t.Log(m.print())
 
 	tb = m.table()
-	t.Log("shrink 2")
-	m.tryResize(tb.width, 2)
+	t.Log("shrink to 2 from", tb.width)
 
-	t.Log("shrink 2: wait")
-	m.waitShrink(2)
-	t.Log("shrink 2: fill")
+	m.resize(tb.width, 2)
+	m.waitVersion(tb.version + 1)
+
+	t.Log("filling jump table")
 	m.fill()
-
 	t.Log(m.print())
 
-	m.waitResize()
 	tb = m.table()
-
-	t.Log("done, shrinking from", tb.width)
-
+	t.Log("shrinking to 0")
 	m.resize(tb.width, 0)
-	m.waitShrink(0)
-	t.Log(m.table().width)
+	m.waitVersion(tb.version + 1)
+	t.Log("shrink complete")
 	t.Log(m.print())
+	tb = m.table()
+	t.Log("table now at version", tb.version)
 
 }
 
@@ -339,12 +334,12 @@ func TestRun(t *testing.T) {
 	t.Log("lookups done, table now ", tb.width, "wide, at version", tb.version)
 
 	t.Log("waiting for any resize to exit")
-	m.waitResize()
+	m.waitStable()
 	tb = m.table()
 	t.Log("resizes over, table now ", tb.width, "wide, at version", tb.version)
 	t.Log("shrinking to 0")
 	m.resize(tb.width, 0)
-	m.waitShrink(0)
+	m.waitVersion(tb.version + 1)
 	tb = m.table()
 	if tb.width > 0 {
 		t.Fatal("table should be 0 wide, is", tb.width)

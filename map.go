@@ -1345,58 +1345,46 @@ func (m *Map[K, V]) fill() {
 		}
 	}
 }
-
-func (m *Map[K, V]) waitResize() {
+func (m *Map[K, V]) waitStable() uint {
 	for true {
 		t := m.t.Load()
-		t.pause()
 		if t == nil {
 			break
 		}
-		if t.old.Load() != nil {
-			continue
-		}
 		if t.new.Load() != nil {
+			t.pause()
 			continue
 		}
-		break
+		if t.old.Load() != nil {
+			t.pause()
+			continue
+		}
+		return t.version
 	}
+	return 0
 }
 
-func (m *Map[K, V]) waitGrow(w int) {
+func (m *Map[K, V]) waitVersion(v uint) uint {
 	for true {
 		t := m.t.Load()
-		t.pause()
 		if t == nil {
-			break
+			if v == 0 {
+				return 0
+			}
+			t.pause()
+			continue
 		}
 		if t.new.Load() != nil {
+			t.pause()
 			continue
 		}
 		if t.old.Load() != nil {
+			t.pause()
 			continue
 		}
-		if t.width >= w {
-			return
+		if t.version >= v {
+			return t.version
 		}
 	}
-}
-
-func (m *Map[K, V]) waitShrink(w int) {
-	for true {
-		t := m.t.Load()
-		t.pause()
-		if t == nil {
-			break
-		}
-		if t.new.Load() != nil {
-			continue
-		}
-		if t.old.Load() != nil {
-			continue
-		}
-		if t.width <= w {
-			return
-		}
-	}
+	return 0
 }
