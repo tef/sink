@@ -35,9 +35,12 @@ func (e *Executor) Go(f func()) {
 }
 
 func TestMapBasic(t *testing.T) {
+	var ok bool
+	var v any
+
 	m := &Map{}
 	m.Store("key", 123)
-	v, ok := m.Load("key")
+	v, ok = m.Load("key")
 	if !ok {
 		t.Fatal("missing")
 	} else if v.(int) != 123 {
@@ -46,7 +49,9 @@ func TestMapBasic(t *testing.T) {
 		t.Logf("lookup: %v", v)
 	}
 
+	t.Log("store")
 	m.Store("key", 456)
+
 	v, ok = m.Load("key")
 	if !ok {
 		t.Fatal("missing")
@@ -56,10 +61,19 @@ func TestMapBasic(t *testing.T) {
 		t.Logf("lookup: %v", v)
 	}
 
-	old, ok := m.LoadAndDelete("key")
+	v, ok = m.LoadOrStore("key", 789)
 	if !ok {
 		t.Fatal("missing")
-	} else if old.(int) != 456 {
+	} else if v.(int) != 456 {
+		t.Fatal("wrong", v)
+	} else {
+		t.Logf("load or store: %v", v)
+	}
+
+	v, ok = m.LoadAndDelete("key")
+	if !ok {
+		t.Fatal("missing")
+	} else if v.(int) != 456 {
 		t.Fatal("wrong", v)
 	} else {
 		t.Logf("load and delete: %v", v)
@@ -72,9 +86,54 @@ func TestMapBasic(t *testing.T) {
 		t.Logf("deleted")
 	}
 
-	old, ok = m.LoadAndDelete("key")
+	v, ok = m.LoadOrStore("key", 789)
 	if ok {
-		t.Fatal("not deleted")
+		t.Fatal("missing")
+	} else {
+		t.Logf("load or store: %v", v)
+	}
+
+	v, ok = m.Swap("key", 101112)
+	if !ok {
+		t.Fatal("missing")
+	} else if v.(int) != 789 {
+		t.Fatal("wrong", v)
+	} else {
+		t.Logf("load and delete: %v", v)
+	}
+
+	v, ok = m.LoadAndDelete("key")
+	if !ok {
+		t.Fatal("missing")
+	} else if v.(int) != 101112 {
+		t.Fatal("wrong", v)
+	} else {
+		t.Logf("load and delete: %v", v)
+	}
+
+	v, ok = m.LoadAndDelete("key")
+	if ok {
+		t.Fatal("not deleted", v)
+	}
+
+	v, ok = m.Swap("key", 131415)
+	if ok {
+		t.Fatal("missing")
+	} else {
+		t.Logf("swap %v", v)
+	}
+
+	ok = m.CompareAndSwap("key", 131415, 161718)
+	if !ok {
+		t.Fatal("missing")
+	} else {
+		t.Logf("compare and swap")
+	}
+	ok = m.CompareAndDelete("key", 161718)
+	if !ok {
+		t.Fatal("missing")
+	} else {
+		t.Logf("compare and delete")
 	}
 
 }

@@ -769,7 +769,7 @@ func (t *table) storeSlow(e *entry, shouldGrow *bool, cond conditionFunc) (old *
 
 }
 
-func (t *table) delete(e *entry, shouldShrink *bool) *entry {
+func (t *table) delete(e *entry, shouldShrink *bool, cond conditionFunc) (*entry, bool) {
 	var deleted *entry
 	for true {
 		c := t.waypointFor(e)
@@ -777,7 +777,11 @@ func (t *table) delete(e *entry, shouldShrink *bool) *entry {
 		deleted = c.find(e)
 
 		if deleted == nil {
-			return nil
+			return nil, false
+		}
+
+		if cond != nil && !cond(deleted, e) {
+			return deleted, false
 		}
 
 		if !c.insert_after_match(e) {
@@ -797,7 +801,7 @@ func (t *table) delete(e *entry, shouldShrink *bool) *entry {
 
 		break
 	}
-	return deleted
+	return deleted, true
 }
 
 func (t *table) resize(from int, to int) *table {
@@ -1110,6 +1114,8 @@ func (m *Map) Load(key string) (value any, ok bool) {
 	return nil, false
 }
 
+var noCondition conditionFunc = nil
+
 func (m *Map) Store(key string, value any) {
 	t := m.table()
 
@@ -1120,11 +1126,110 @@ func (m *Map) Store(key string, value any) {
 	}
 
 	var shouldGrow bool
-	t.store(e, &shouldGrow, nil)
+	t.store(e, &shouldGrow, noCondition)
 
 	if shouldGrow {
 		m.resize(t.width, t.width+1)
 	}
+}
+
+func (m *Map) Swap(key string, value any) (previous any, loaded bool) {
+	// aka Store and return old value, if any
+	t := m.table()
+
+	e := &entry{
+		hash:  t.hash(key),
+		key:   key,
+		value: value,
+	}
+
+	var shouldGrow bool
+
+	old, _ := t.store(e, &shouldGrow, noCondition)
+
+	if shouldGrow {
+		m.resize(t.width, t.width+1)
+	}
+
+	if old == nil {
+		return nil, false
+	} else {
+		return old.value, true
+	}
+}
+
+func loadOrStore(old *entry, new *entry) bool {
+	return old == nil
+}
+
+func (m *Map) LoadOrStore(key string, value any) (actual any, loaded bool) {
+	t := m.table()
+
+	e := &entry{
+		hash:  t.hash(key),
+		key:   key,
+		value: value,
+	}
+
+	var shouldGrow bool
+
+	old, inserted := t.store(e, &shouldGrow, loadOrStore)
+
+	if shouldGrow {
+		m.resize(t.width, t.width+1)
+	}
+
+	if inserted {
+		return value, false
+	} else {
+		return old.value, true
+	}
+}
+
+func (m *Map) CompareAndSwap(key string, oldValue any, value any) (swapped bool) {
+	t := m.table()
+
+	e := &entry{
+		hash:  t.hash(key),
+		key:   key,
+		value: value,
+	}
+
+	var shouldGrow bool
+
+	compareAndSwap := func(old *entry, new *entry) bool {
+		return old != nil && old.value == oldValue
+	}
+
+	_, inserted := t.store(e, &shouldGrow, compareAndSwap)
+
+	if shouldGrow {
+		m.resize(t.width, t.width+1)
+	}
+	return inserted
+}
+
+func (m *Map) CompareAndDelete(key string, oldValue any) (deleted bool) {
+	t := m.table()
+
+	e := &entry{
+		hash:  t.hash(key),
+		key:   key,
+		value: oldValue,
+	}
+
+	var shouldShrink bool
+	compareAndDelete := func(old *entry, new *entry) bool {
+		return old != nil && old.value == oldValue
+	}
+
+	_, deleted = t.delete(e, &shouldShrink, compareAndDelete)
+
+	if shouldShrink {
+		m.resize(t.width, t.width-1)
+	}
+
+	return deleted
 }
 
 func (m *Map) Delete(key string) {
@@ -1138,11 +1243,12 @@ func (m *Map) Delete(key string) {
 
 	var shouldShrink bool
 
-	t.delete(e, &shouldShrink)
+	t.delete(e, &shouldShrink, noCondition)
 	if shouldShrink {
 		m.resize(t.width, t.width-1)
 	}
 }
+
 func (m *Map) LoadAndDelete(key string) (value any, loaded bool) {
 	t := m.table()
 	hash := t.tombstone_hash(key)
@@ -1154,13 +1260,13 @@ func (m *Map) LoadAndDelete(key string) (value any, loaded bool) {
 
 	var shouldShrink bool
 
-	deleted := t.delete(e, &shouldShrink)
+	old, _ := t.delete(e, &shouldShrink, noCondition)
 
 	if shouldShrink {
 		m.resize(t.width, t.width-1)
 	}
-	if deleted != nil {
-		return deleted.value, true
+	if old != nil {
+		return old.value, true
 	}
 	return nil, false
 }
@@ -1192,14 +1298,7 @@ func (m *Map) Range(f func(key string, value any) bool) {
 	}
 }
 
-/*
-   CompareAndSwap(key, old, new any) (swapped bool)
-   Swap(key, value any) (previous any, loaded bool)
-
-   CompareAndDelete(key, old any) (deleted bool)
-   LoadOrStore(key, value any) (actual any, loaded bool)
-
-*/
+// --- test helpers
 
 func (m *Map) fill() {
 	t := m.table()
