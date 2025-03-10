@@ -138,6 +138,7 @@ import (
 	"cmp"
 	"fmt"
 	"hash/maphash"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -388,7 +389,7 @@ func (c *cursor) repair_from_start() bool {
 	return true
 }
 
-func (c *cursor) count_empty(n int) int {
+func (c *cursor) count_empty_successors(n int) int {
 	// check the next entries for dummy entries
 	// which is used by delete to know when to shrink
 
@@ -626,7 +627,7 @@ func (t *table) lookup(e *entry) *entry {
 	return nil
 }
 
-func (t *table) store(e *entry) (bool, int) {
+func (t *table) store(e *entry) (*entry, bool) {
 	c := t.cursorFor(e)
 
 	if !c.find(e) {
@@ -642,14 +643,15 @@ func (t *table) store(e *entry) (bool, int) {
 		}
 	}
 
-	return true, c.count
+	return e, c.count > maxInsertCount
 }
 
-func (t *table) storeSlow(e *entry) (bool, int) {
+func (t *table) storeSlow(e *entry) (*entry, bool) {
+	var c cursor
 	for true {
-		c := t.cursorFor(e)
+		c = t.cursorFor(e)
 
-		if !c.find(e) {
+		if !c.findSlow(e) {
 			if !c.insert_after_prev(e) {
 				t.pause()
 				continue
@@ -663,21 +665,23 @@ func (t *table) storeSlow(e *entry) (bool, int) {
 				c.repair_from_start()
 			}
 		}
-
-		return true, c.count
-
+		break
 	}
-	return false, -1
+
+	return e, c.count > maxInsertCount
 }
 
-func (t *table) delete(e *entry, maxCount int) (bool, int) {
+func (t *table) delete(e *entry) (*entry, bool) {
 	count := 0
+	var deleted *entry
 	for true {
 		c := t.cursorFor(e)
 
 		if !c.find(e) {
-			return false, 0
+			return nil, false
 		}
+
+		deleted = c.match
 
 		if !c.insert_after_match(e) {
 			t.pause()
@@ -690,13 +694,13 @@ func (t *table) delete(e *entry, maxCount int) (bool, int) {
 
 		if c.prev.isDummy() {
 			// check to see if we're the last item
-			count = c.count_empty(maxCount-1) + 1
+			count = c.count_empty_successors(maxEmptyDummy-1) + 1
 		}
 
 		break
 	}
 
-	return true, count
+	return deleted, count >= maxEmptyDummy
 }
 
 func (t *table) resize(from int, to int) *table {
@@ -852,9 +856,77 @@ func (t *table) sweepOld() {
 	// fmt.Printf("done sweeping v%d's old (v%d), clearing old\n", t.version, old.version)
 
 }
+func (t *table) print() string {
+
+	var b strings.Builder
+
+	s := fmt.Sprintln("table", t.width, "version", t.version)
+	b.WriteString(s)
+
+	next := t.start
+
+	for next != nil {
+		var v string
+		if next.isDummy() {
+			v = ""
+		} else if next.isDeleted() {
+			v = fmt.Sprintf("-%v\n", next.key)
+		} else {
+			v = fmt.Sprintf("+%v:%v", next.key, next.value)
+		}
+		s := fmt.Sprintf("%064b %v\n", next.hash, v)
+		b.WriteString(s)
+		next = next.next.Load()
+	}
+	return b.String()
+}
 
 type Map struct {
 	t atomic.Pointer[table]
+}
+
+func (m *Map) table() *table {
+	t := m.t.Load()
+	if t != nil {
+		return t
+	}
+
+	start := &entry{
+		hash: 0,
+	}
+	end := &entry{
+		hash: ^uint64(0) - 1,
+	}
+
+	start.next.Store(end)
+
+	entries := make([]atomic.Pointer[entry], 1)
+
+	entries[0].Store(start)
+
+	expunged := &entry{
+		hash: ^uint64(0),
+	}
+
+	t = &table{
+		seed:     maphash.MakeSeed(),
+		start:    start,
+		end:      end,
+		width:    0,
+		entries:  entries,
+		expunged: expunged,
+	}
+
+	if m.t.CompareAndSwap(nil, t) {
+		return t
+	} else {
+		return m.t.Load()
+	}
+}
+
+func (m *Map) print() string {
+	t := m.table()
+	return t.print()
 }
 
 func (m *Map) resize(from int, to int) {
@@ -905,6 +977,69 @@ func (m *Map) tryResize(from int, to int) {
 		nt.sweepOld()
 	}
 }
+
+func (m *Map) fill() {
+	t := m.table()
+
+	for i := range t.entries {
+		if t.entries[i].Load() == nil {
+			t.insertDummy(uint64(i))
+		}
+	}
+}
+
+func (m *Map) Clear() {
+	m.t.Store(nil)
+}
+
+func (m *Map) Load(key string) (value any, ok bool) {
+	t := m.table()
+	e := entry{
+		hash: t.hash(key),
+		key:  key,
+	}
+
+	match := t.lookup(&e)
+
+	if match != nil {
+		return match.value, true
+	}
+	return nil, false
+}
+
+func (m *Map) Store(key string, value any) {
+	t := m.table()
+
+	e := &entry{
+		hash:  t.hash(key),
+		key:   key,
+		value: value,
+	}
+
+	inserted, shouldGrow := t.store(e)
+
+	if inserted == nil {
+		panic("bad: failed to insert into map")
+	}
+	if shouldGrow {
+		m.resize(t.width, t.width+1)
+	}
+}
+func (m *Map) Delete(key string) {
+	t := m.table()
+	hash := t.tombstone_hash(key)
+
+	e := &entry{
+		hash: hash,
+		key:  key,
+	}
+
+	_, shouldShrink := t.delete(e)
+	if shouldShrink {
+		m.resize(t.width, t.width-1)
+	}
+}
+
 func (m *Map) waitResize() {
 	for true {
 		t := m.t.Load()
@@ -957,132 +1092,5 @@ func (m *Map) waitShrink(w int) {
 		if t.width <= w {
 			return
 		}
-	}
-}
-
-func (m *Map) fill() {
-	t := m.table()
-
-	for i := range t.entries {
-		if t.entries[i].Load() == nil {
-			t.insertDummy(uint64(i))
-		}
-	}
-}
-
-func (m *Map) Clear() {
-	m.t.Store(nil)
-}
-
-func (m *Map) table() *table {
-	t := m.t.Load()
-	if t != nil {
-		return t
-	}
-
-	start := &entry{
-		hash: 0,
-	}
-	end := &entry{
-		hash: ^uint64(0) - 1,
-	}
-
-	start.next.Store(end)
-
-	entries := make([]atomic.Pointer[entry], 1)
-
-	entries[0].Store(start)
-
-	expunged := &entry{
-		hash: ^uint64(0),
-	}
-
-	t = &table{
-		seed:     maphash.MakeSeed(),
-		start:    start,
-		end:      end,
-		width:    0,
-		entries:  entries,
-		expunged: expunged,
-	}
-
-	if m.t.CompareAndSwap(nil, t) {
-		return t
-	} else {
-		return m.t.Load()
-	}
-}
-
-func (m *Map) Load(key string) (value any, ok bool) {
-	t := m.table()
-	e := entry{
-		hash: t.hash(key),
-		key:  key,
-	}
-
-	match := t.lookup(&e)
-
-	if match != nil {
-		if  match.compare(&e) != 0 || match.isDeleted() {
-			panic("bad: lookup returned bad match")
-		}
-
-		return match.value, true
-	}
-	return nil, false
-}
-
-func (m *Map) Store(key string, value any) {
-	t := m.table()
-
-	e := &entry{
-		hash:  t.hash(key),
-		key:   key,
-		value: value,
-	}
-
-	ok, count := t.store(e)
-
-	if !ok {
-		panic("bad: failed to insert into map")
-	}
-	if count > maxInsertCount {
-		m.resize(t.width, t.width+1)
-	}
-}
-func (m *Map) Delete(key string) {
-	t := m.table()
-
-	hash := t.tombstone_hash(key)
-
-	e := &entry{
-		hash: hash,
-		key:  key,
-	}
-
-	_, count := t.delete(e, maxEmptyDummy)
-	if count >= maxEmptyDummy {
-		m.resize(t.width, t.width-1)
-	}
-}
-
-func (m *Map) print() {
-	t := m.table()
-
-	fmt.Println("table", t.width, "version", t.version)
-
-	next := t.start
-
-	for next != nil {
-		var v string
-		if next.isDummy() {
-			v = ""
-		} else if next.isDeleted() {
-			v = fmt.Sprintf("-%v\n", next.key)
-		} else {
-			v = fmt.Sprintf("+%v:%v", next.key, next.value)
-		}
-		fmt.Printf("%064b %v\n", next.hash, v)
-		next = next.next.Load()
 	}
 }

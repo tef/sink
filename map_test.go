@@ -84,7 +84,7 @@ func TestMapGrow(t *testing.T) {
 	m.waitShrink(2)
 	t.Log("shrink 2: fill")
 	m.fill()
-	m.print()
+	t.Log(m.print())
 
 	t.Log("first wave")
 
@@ -151,15 +151,15 @@ func TestMapGrow(t *testing.T) {
 	m.resize(tb.width, 0)
 	m.waitShrink(0)
 	t.Log(m.table().width)
-	m.print()
+	t.Log(m.print())
 
 }
 
 func TestMapDelete(t *testing.T) {
 	m := &Map{}
-	m.print()
+	t.Log(m.print())
 	m.Store("key", 123)
-	m.print()
+	t.Log(m.print())
 	m.Delete("key")
-	m.print()
+	t.Log(m.print())
 }
