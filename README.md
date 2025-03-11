@@ -3,6 +3,17 @@
 This package contains a lock-free, generic, concurrent map
 which provides the same methods as the built in sync.Map.
 
+```
+m := sink.Map[string, string]{}
+
+m.Store("key", "value")
+m.Load("key")
+m.Delete("key")
+m.CompareAndSwap("key", "old", "new")
+
+// and so on
+```
+
 Yes, it's all lock free: lookups, inserts, updates, deletes, as
 well as scanning all entries, shrinking and growing the map.
 
