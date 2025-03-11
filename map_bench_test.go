@@ -3,6 +3,7 @@ package sink
 import (
 	"fmt"
 	"testing"
+	"sync"
 	"sync/atomic"
 )
 
@@ -126,4 +127,80 @@ func TestRunMillion(t *testing.T) {
 	}
 	tb = m.table()
 	t.Log("shrink done, table now ", tb.width, "wide, at version", tb.version)
+}
+
+func TestRunSync(t *testing.T) {
+	n := 1_000_000 * 2
+
+	m := sync.Map{}
+	m.Store("key", 123)
+
+	ex := Executor{fake: false}
+
+	t.Log("running", n, "inserts")
+
+	for i := 0; i < n; i++ {
+		ex.Go(func() {
+			key := fmt.Sprint(i)
+			val := i
+			m.Store(key, val)
+			v, ok := m.Load(key)
+			if !ok || v.(int) != val {
+				t.Fatal("missing", key, ok, v, "expected", val)
+			}
+		})
+	}
+
+	t.Log("waiting on inserts")
+	ex.Wait()
+
+	t.Log("running", n, "updates")
+
+	ex = Executor{fake: false}
+
+	for i := 0; i < n; i++ {
+		ex.Go(func() {
+			key := fmt.Sprint(i)
+			val := i - 1
+			m.Store(key, val)
+			v, ok := m.Load(key)
+			if !ok || v.(int) != val {
+				t.Fatal("missing", key, ok, v, "expected", val)
+			}
+		})
+	}
+	t.Log("waiting on updates")
+	ex.Wait()
+
+	t.Log("running", n, "deletes")
+
+	ex = Executor{fake: false}
+
+	for i := 0; i < n; i++ {
+		ex.Go(func() {
+			key := fmt.Sprint(i)
+			m.Delete(key)
+		})
+	}
+	t.Log("waiting on deletes")
+	ex.Wait()
+
+	t.Log("running", n, "lookups")
+
+	ex = Executor{fake: false}
+
+	for i := 0; i < n; i++ {
+		ex.Go(func() {
+			key := fmt.Sprint(i)
+			val, ok := m.Load(key)
+			if ok {
+				t.Fatal("deleted key", key, "has value", val)
+			}
+		})
+	}
+	t.Log("waiting on lookups")
+	ex.Wait()
+
+	t.Log("lookups done")
+	m.Clear()
 }
