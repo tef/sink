@@ -10,6 +10,8 @@ package sink
 //
 // it's basically a lookup table and a linked list inside a trench coat.
 //
+//
+//
 // first, the linked list:
 //
 // we start with a singly linked-list of (hash, key, value) entries,
@@ -113,6 +115,7 @@ package sink
 // mean resizing can be blocked by other threads.
 //
 //
+//
 // finally, resizes:
 //
 // as for triggering resizes, instead of keeping accurate list sizes, we
@@ -124,48 +127,6 @@ package sink
 // - if we delete an item, and it's the last item between waypoints, we
 //   check to see how many empty sections come after the item, and if
 //   it is above some threshold, we tell the map to halve the table
-//
-// ... and that's pretty much everything, except for one final detail.
-//
-//
-// related work:
-//
-// this structure is very similar to, and directly inspired by the
-// split-ordered list, another concurrent map described in:
-//
-//       "Split-Ordered Lists: Lock-Free Extensible Hash Tables"
-//
-// the paper also uses a lock-free linked list and a jump table
-// to speed up searches. the key differences are:
-//
-// the paper uses pointer tagging to freeze out next pointers, whereas
-// we use a tombstone. they can stop at the first match, but we have to
-// continue.
-//
-// tagging pointers might require a little bit of cooperation from the
-// garbage collector, which is why we do not use it here
-//
-// the other major difference is that the paper uses a bithack to
-// avoid reordering the jump table during resizes. instead of lexicographic
-// order, they reverse the bits and so effectively sort it by trailing
-// zero count, so '1', '10', '100', all map to the same slot.
-//
-// this means that resizing a table only involves appending to the jump table
-// which is kinda nice, but not nice enough to do the same here.
-//
-// as we replace the jump table each time it grows, we don't need
-// to worry about preserving the offsets into the table during resizes,
-//
-// keeping things in lexicographic order means that we can
-// handle missing waypoint entries in the jump table with very little fuss.
-//
-// we also use different logic to manage splitting and growing.
-// but that's a given, frankly.
-//
-// in some ways, this is a simplification (no pointer tagging, no bithacks)
-// but in others, it's a complication (read until last match, tombstones)
-//
-// c'est la vie
 //
 
 import (
