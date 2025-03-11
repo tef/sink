@@ -1,4 +1,4 @@
-package xsync
+package sink
 
 // this package contains a lock-free, generic, concurrent map
 // which provides the same methods as the built in sync.Map
@@ -180,15 +180,15 @@ import (
 
 // type aliases
 
-type Key cmp.Ordered
-type Value comparable
+type Key cmp.Ordered     // because we can't cmp.Compare comparable objects
+type Value comparable    // ... and you know, in python, there's a total sort order
 
 type conditionFunc[K Key, V Value] func(old *entry[K, V], new *entry[K, V]) bool
 
 // tuning params:
 
-const defaultInsertCount = 6 // length of search before suggesting grow, on insert new
-const defaultEmptyCount = 2  // empty waypoints before suggesting shrink, on delete
+const defaultInsertCount = 7 // length of search before suggesting grow, on insert new
+const defaultEmptyCount = 3  // empty waypoints before suggesting shrink, on delete
 
 // as mentioned above, we use simple heuristics for growing/shrinking
 // the following defaults can be overriden per-map

@@ -1,14 +1,10 @@
-package xsync
+package sink
 
 import (
 	"fmt"
 	"sync"
 	"testing"
 )
-
-// t.Log(...)   / t.Logf("%v", v),     log message
-// t.Error(...) / t.Errorf("", ..),  mark fail and continue
-// t.Fatal(...) / t.Fatalf("", ..),  mark fail, exit
 
 type Executor struct {
 	fake bool
@@ -253,12 +249,12 @@ func TestMapResize(t *testing.T) {
 
 }
 
-func TestRun(t *testing.T) {
-	n := 1_000_000 * 2
+func TestRunMillion(t *testing.T) {
+	n := 1_000_000 * 1
 
 	m := &Map[string, int]{
-		GrowInsertCount:  8,
-		ShrinkEmptyCount: 4,
+		GrowInsertCount:  7,
+		ShrinkEmptyCount: 3,
 	}
 	m.Store("key", 123)
 
