@@ -248,4 +248,3 @@ func TestMapResize(t *testing.T) {
 	t.Log("table now at version", tb.version)
 
 }
-

@@ -141,15 +141,17 @@ import (
 
 // type aliases
 
-type Key cmp.Ordered     // because we can't cmp.Compare comparable objects
-type Value comparable    // ... and you know, in python, there's a total sort order
+type Key cmp.Ordered  // because we can't cmp.Compare comparable objects
+type Value comparable // ... and you know, in python, there's a total sort order
 
 type conditionFunc[K Key, V Value] func(old *entry[K, V], new *entry[K, V]) bool
 
 // tuning params:
 
-const defaultInsertCount = 7 // length of search before suggesting grow, on insert new
-const defaultEmptyCount = 3  // empty waypoints before suggesting shrink, on delete
+const defaultInsertCount = 16 // leads to ~8 entries between waypoints
+const defaultEmptyCount = 2   // empty waypoints before suggesting shrink, on delete
+const defaultGrowAmount = 1   // double the table
+const defaultShrinkAmount = 2 // quarter the table
 
 // as mentioned above, we use simple heuristics for growing/shrinking
 // the following defaults can be overriden per-map
@@ -204,11 +206,26 @@ func (e *entry[K, V]) isWaypoint() bool {
 }
 
 func (e *entry[K, V]) compare(o *entry[K, V]) int {
-	return cmp.Or(
-		// deleted items compare the same
-		cmp.Compare(e.hash>>1, o.hash>>1),
-		cmp.Compare(e.key, o.key),
-	)
+	ehash := e.hash >> 1
+	ohash := o.hash >> 1
+
+	if ehash < ohash {
+		return -1
+	} else if ehash > ohash {
+		return 1
+	}
+
+	ekey := e.key
+	okey := o.key
+
+	if ekey == okey {
+		return 0
+	} else if ekey < okey {
+		return -1
+	} else {
+		return 1
+	}
+
 }
 
 func (e *entry[K, V]) insert_after(old *entry[K, V], value *entry[K, V]) bool {
@@ -483,8 +500,10 @@ type table[K Key, V Value] struct {
 
 	expunged *entry[K, V]
 
-	growInsertCount  int
-	shrinkEmptyCount int
+	growOnInsertCount  int
+	shrinkOnEmptyCount int
+	growAmount         int
+	shrinkAmount       int
 }
 
 func (t *table[K, V]) pause() {
@@ -707,7 +726,9 @@ func (t *table[K, V]) store(e *entry[K, V], shouldGrow *bool, cond conditionFunc
 		if !c.insert_after_prev(e) {
 			return t.storeSlow(e, shouldGrow, cond)
 		}
-		*shouldGrow = c.count > t.growInsertCount
+		if t.growOnInsertCount > 0 {
+			*shouldGrow = c.count > t.growOnInsertCount
+		}
 		return nil, true
 	} else {
 		if !c.insert_after_match(e) {
@@ -739,7 +760,9 @@ func (t *table[K, V]) storeSlow(e *entry[K, V], shouldGrow *bool, cond condition
 				t.pause()
 				continue
 			}
-			*shouldGrow = c.count > t.growInsertCount
+			if t.growOnInsertCount > 0 {
+				*shouldGrow = c.count > t.growOnInsertCount
+			}
 			return nil, true
 		}
 
@@ -783,10 +806,10 @@ func (t *table[K, V]) delete(e *entry[K, V], shouldShrink *bool, cond conditionF
 			c.repair_from_start()
 		}
 
-		if c.prev.isWaypoint() {
+		if t.shrinkOnEmptyCount > 0 && c.prev.isWaypoint() && c.next.isWaypoint() {
 			// check to see if we're the last item
-			count := c.count_adjacent_waypoints(t.shrinkEmptyCount-1) + 1
-			*shouldShrink = count >= t.shrinkEmptyCount
+			count := c.count_adjacent_waypoints(t.shrinkOnEmptyCount-1) + 1
+			*shouldShrink = count >= t.shrinkOnEmptyCount
 		}
 
 		break
@@ -795,8 +818,12 @@ func (t *table[K, V]) delete(e *entry[K, V], shouldShrink *bool, cond conditionF
 }
 
 func (t *table[K, V]) resize(from int, to int) *table[K, V] {
-	if to < 0 || to > maxHashBits {
-		return nil
+	if to < 0 {
+		to = 0
+	}
+
+	if to > maxHashBits {
+		to = maxHashBits
 	}
 	if to == t.width || from != t.width {
 		return nil
@@ -815,15 +842,17 @@ func (t *table[K, V]) resize(from int, to int) *table[K, V] {
 		new_table[0].Store(t.start)
 
 		nt = &table[K, V]{
-			version:          t.version + 1,
-			start:            t.start,
-			end:              t.end,
-			seed:             t.seed,
-			width:            to,
-			entries:          new_table,
-			expunged:         t.expunged,
-			growInsertCount:  t.growInsertCount,
-			shrinkEmptyCount: t.shrinkEmptyCount,
+			version:            t.version + 1,
+			start:              t.start,
+			end:                t.end,
+			seed:               t.seed,
+			width:              to,
+			entries:            new_table,
+			expunged:           t.expunged,
+			growOnInsertCount:  t.growOnInsertCount,
+			shrinkOnEmptyCount: t.shrinkOnEmptyCount,
+			growAmount:         t.growAmount,
+			shrinkAmount:       t.shrinkAmount,
 		}
 
 		nt.old.Store(t)
@@ -991,8 +1020,10 @@ func (t *table[K, V]) print() string {
 type Map[K Key, V Value] struct {
 	t atomic.Pointer[table[K, V]]
 
-	GrowInsertCount  int
-	ShrinkEmptyCount int
+	GrowOnInsertCount  int
+	ShrinkOnEmptyCount int
+	GrowAmount         int
+	ShrinkAmount       int
 }
 
 func (m *Map[K, V]) table() *table[K, V] {
@@ -1013,21 +1044,26 @@ func (m *Map[K, V]) table() *table[K, V] {
 
 	start.next.Store(end)
 
-	grow := cmp.Or(m.GrowInsertCount, defaultInsertCount)
-	shrink := cmp.Or(m.ShrinkEmptyCount, defaultEmptyCount)
+	growCount := cmp.Or(m.GrowOnInsertCount, defaultInsertCount)
+	shrinkCount := cmp.Or(m.ShrinkOnEmptyCount, defaultEmptyCount)
+
+	growAmount := cmp.Or(m.GrowAmount, defaultGrowAmount)
+	shrinkAmount := cmp.Or(m.ShrinkAmount, defaultShrinkAmount)
 
 	entries := make([]atomic.Pointer[entry[K, V]], 1)
 	entries[0].Store(start)
 
 	t = &table[K, V]{
-		seed:             maphash.MakeSeed(),
-		start:            start,
-		end:              end,
-		width:            0,
-		entries:          entries,
-		expunged:         expunged,
-		growInsertCount:  grow,
-		shrinkEmptyCount: shrink,
+		seed:               maphash.MakeSeed(),
+		start:              start,
+		end:                end,
+		width:              0,
+		entries:            entries,
+		expunged:           expunged,
+		growOnInsertCount:  growCount,
+		shrinkOnEmptyCount: shrinkCount,
+		growAmount:         growAmount,
+		shrinkAmount:       shrinkAmount,
 	}
 
 	if m.t.CompareAndSwap(nil, t) {
@@ -1127,7 +1163,7 @@ func (m *Map[K, V]) Store(key K, value V) {
 	t.store(e, &shouldGrow, nil)
 
 	if shouldGrow {
-		m.resize(t.width, t.width+1)
+		m.resize(t.width, t.width+t.growAmount)
 	}
 }
 
@@ -1146,7 +1182,7 @@ func (m *Map[K, V]) Swap(key K, value V) (previous V, loaded bool) {
 	old, _ := t.store(e, &shouldGrow, nil)
 
 	if shouldGrow {
-		m.resize(t.width, t.width+1)
+		m.resize(t.width, t.width+t.growAmount)
 	}
 
 	if old == nil {
@@ -1175,7 +1211,7 @@ func (m *Map[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
 	old, inserted := t.store(e, &shouldGrow, loadOrStore)
 
 	if shouldGrow {
-		m.resize(t.width, t.width+1)
+		m.resize(t.width, t.width+t.growAmount)
 	}
 
 	if inserted {
@@ -1203,7 +1239,7 @@ func (m *Map[K, V]) CompareAndSwap(key K, oldValue V, value V) (swapped bool) {
 	_, inserted := t.store(e, &shouldGrow, compareAndSwap)
 
 	if shouldGrow {
-		m.resize(t.width, t.width+1)
+		m.resize(t.width, t.width+t.growAmount)
 	}
 	return inserted
 }
@@ -1226,7 +1262,7 @@ func (m *Map[K, V]) CompareAndDelete(key K, oldValue V) (deleted bool) {
 	_, deleted = t.delete(e, &shouldShrink, compareAndDelete)
 
 	if shouldShrink {
-		m.resize(t.width, t.width-1)
+		m.resize(t.width, t.width-t.shrinkAmount)
 	}
 
 	return deleted
@@ -1245,7 +1281,7 @@ func (m *Map[K, V]) Delete(key K) {
 
 	t.delete(e, &shouldShrink, nil)
 	if shouldShrink {
-		m.resize(t.width, t.width-1)
+		m.resize(t.width, t.width-t.shrinkAmount)
 	}
 }
 
@@ -1263,7 +1299,7 @@ func (m *Map[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
 	old, _ := t.delete(e, &shouldShrink, nil)
 
 	if shouldShrink {
-		m.resize(t.width, t.width-1)
+		m.resize(t.width, t.width-t.shrinkAmount)
 	}
 	if old != nil {
 		return old.value, true

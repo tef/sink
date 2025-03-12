@@ -2,9 +2,9 @@ package sink
 
 import (
 	"fmt"
-	"testing"
 	"sync"
 	"sync/atomic"
+	"testing"
 )
 
 func BenchmarkMap(b *testing.B) {
@@ -32,8 +32,10 @@ func TestRunMillion(t *testing.T) {
 	n := 1_000_000 * 1
 
 	m := &Map[string, int]{
-		GrowInsertCount:  7,
-		ShrinkEmptyCount: 3,
+		GrowOnInsertCount:  16,
+		ShrinkOnEmptyCount: 2,
+		GrowAmount:         1,
+		ShrinkAmount:       2,
 	}
 	m.Store("key", 123)
 
@@ -118,9 +120,11 @@ func TestRunMillion(t *testing.T) {
 	m.waitStable()
 	tb = m.table()
 	t.Log("resizes over, table now ", tb.width, "wide, at version", tb.version)
-	t.Log("shrinking to 0")
-	m.resize(tb.width, 0)
-	m.waitVersion(tb.version + 1)
+	if tb.width > 0 {
+		t.Log("shrinking to 0")
+		m.resize(tb.width, 0)
+		m.waitVersion(tb.version + 1)
+	}
 	tb = m.table()
 	if tb.width > 0 {
 		t.Fatal("table should be 0 wide, is", tb.width)
@@ -130,7 +134,7 @@ func TestRunMillion(t *testing.T) {
 }
 
 func TestRunSync(t *testing.T) {
-	n := 1_000_000 * 2
+	n := 1_000_000
 
 	m := sync.Map{}
 	m.Store("key", 123)
